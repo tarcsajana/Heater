@@ -16,23 +16,17 @@ const uint8_t RELAY3_PIN = D6; // HORN (inverted)
 #define ADC_PIN A0
 
 // Defaults
-const char* DEFAULT_MQTT_HOST = "kebnekaise.lmq.cloudamqp.com";
-const uint16_t DEFAULT_MQTT_PORT = 1883;
+const char* MQTT_HOST = "kebnekaise.lmq.cloudamqp.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "lpomtbnx:lpomtbnx";
+const char* MQTT_PASS = "9htYKaGbPej2YOYyHYGZEbkWdpDdT0Mv";
 const char* DEFAULT_BASE_TOPIC = "heater";
-// Default MQTT credentials
-const char* DEFAULT_MQTT_USER = "lpomtbnx:lpomtbnx";
-const char* DEFAULT_MQTT_PASS = "9htYKaGbPej2YOYyHYGZEbkWdpDdT0Mv";
 // Default WiFi credentials (device will attempt to connect to these before starting portal)
 const char* DEFAULT_WIFI_SSID = "HunorCar";
 const char* DEFAULT_WIFI_PASS = "Jucymucy8581";
 
 // EEPROM layout
 struct Config {
-  char mqtt_host[64];
-  uint16_t mqtt_port;
-  char mqtt_user[32];
-  char mqtt_pass[32];
-  char base_topic[32];
   float voltage_divider; // multiply measured ADC voltage to get battery voltage
   float low_voltage_threshold; // in volts
   uint8_t auto_low_enabled; // 1 = enable auto precondition when below threshold
@@ -53,8 +47,6 @@ WiFiManager wifiManager;
 WiFiManagerParameter *p_custom_mqtt_host = nullptr;
 WiFiManagerParameter *p_custom_mqtt_port = nullptr;
 WiFiManagerParameter *p_custom_mqtt_user = nullptr;
-WiFiManagerParameter *p_custom_mqtt_pass = nullptr;
-WiFiManagerParameter *p_custom_base_topic = nullptr;
 WiFiManagerParameter *p_custom_vdiv = nullptr;
 WiFiManagerParameter *p_custom_lowv = nullptr;
 WiFiManagerParameter *p_custom_autolow = nullptr;
@@ -114,11 +106,7 @@ void loadConfig() {
   EEPROM.get(0, cfg);
   if (cfg.magic != CONFIG_MAGIC) {
     // set defaults
-    strncpy(cfg.mqtt_host, DEFAULT_MQTT_HOST, sizeof(cfg.mqtt_host));
-    cfg.mqtt_port = DEFAULT_MQTT_PORT;
-    strncpy(cfg.mqtt_user, DEFAULT_MQTT_USER, sizeof(cfg.mqtt_user));
-    strncpy(cfg.mqtt_pass, DEFAULT_MQTT_PASS, sizeof(cfg.mqtt_pass));
-    strncpy(cfg.base_topic, DEFAULT_BASE_TOPIC, sizeof(cfg.base_topic));
+    memset(&cfg, 0, sizeof(cfg));
     cfg.voltage_divider = 12.0; // default multiplier; adjust in portal
     cfg.low_voltage_threshold = 10.5;
     cfg.auto_low_enabled = 0; // default: disable auto precondition on low battery
@@ -133,7 +121,7 @@ void loadConfig() {
 void setupTopics() {
   String node = WiFi.macAddress();
   node.replace(":", "");
-  topic_base = String(cfg.base_topic) + "/" + node;
+  topic_base = String(DEFAULT_BASE_TOPIC) + "/" + node;
 
   topic_relay1_cmd = topic_base + "/relay1/set";
   topic_relay1_state = topic_base + "/relay1/state";
@@ -240,25 +228,36 @@ void mqttReconnect() {
   };
   if (mqttClient.connected()) return;
   if (millis() - last_mqtt_attempt < 5000UL) return; // backoff: try at most once every 5s
+  
+  // Check WiFi is stable
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skipping MQTT attempt");
+    return;
+  }
+  
   last_mqtt_attempt = millis();
 
   // build a unique client id from MAC
   String nodeId = WiFi.macAddress(); nodeId.replace(":", "");
   String clientId = String("heater-") + nodeId;
-  Serial.printf("Attempting MQTT connect to %s:%u as %s\n", cfg.mqtt_host, cfg.mqtt_port, clientId.c_str());
+  Serial.printf("Attempting MQTT connect to %s:%u as %s\n", MQTT_HOST, MQTT_PORT, clientId.c_str());
+  Serial.printf("  MQTT User: %s (len=%d)\n", MQTT_USER, strlen(MQTT_USER));
+  Serial.printf("  MQTT Pass: %.4s... (len=%d)\n", MQTT_PASS, strlen(MQTT_PASS));
+  
+  // Set connection timeout to avoid hanging
+  mqttClient.setSocketTimeout(5);  // 5 second timeout
+  
   bool ok;
-  if (strlen(cfg.mqtt_user) > 0) {
-    ok = mqttClient.connect(clientId.c_str(), cfg.mqtt_user, cfg.mqtt_pass);
-  } else {
-    ok = mqttClient.connect(clientId.c_str());
-  }
+  ok = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS);
+  Serial.printf("Connection attempt returned: %d\n", ok);
+  
   if (!ok) {
     int8_t st = mqttClient.state();
     Serial.printf("MQTT connect failed: %d (%s)\n", st, mqttStateToString(st));
-    // publish an offline status to broker if possible (may fail if not connected)
-    // attempt a short non-blocking publish by connecting without auth if broker allows
     return;
   }
+  
+  Serial.println("MQTT connected! Setting up topics...");
   if (mqttClient.connected()) {
     setupTopics();
     // publish retained initial states
@@ -277,7 +276,7 @@ void mqttReconnect() {
       ha_discovery_published = true;
     }
   }
-  }
+}
 
 // Create Home Assistant discovery payloads
 void publishHADiscovery() {
@@ -352,20 +351,12 @@ void startSettingsPortal() {
   Serial.printf("Config portal finished, result=%d\n", res ? 1 : 0);
 
   // After portal exits, copy any changed parameters back into cfg (parameters are persistent)
-  if (p_custom_mqtt_host) strncpy(cfg.mqtt_host, p_custom_mqtt_host->getValue(), sizeof(cfg.mqtt_host));
-  if (p_custom_mqtt_port) cfg.mqtt_port = atoi(p_custom_mqtt_port->getValue());
-  if (p_custom_mqtt_user) strncpy(cfg.mqtt_user, p_custom_mqtt_user->getValue(), sizeof(cfg.mqtt_user));
-  if (p_custom_mqtt_pass) strncpy(cfg.mqtt_pass, p_custom_mqtt_pass->getValue(), sizeof(cfg.mqtt_pass));
-  if (p_custom_base_topic) strncpy(cfg.base_topic, p_custom_base_topic->getValue(), sizeof(cfg.base_topic));
   if (p_custom_vdiv) cfg.voltage_divider = atof(p_custom_vdiv->getValue());
   if (p_custom_lowv) cfg.low_voltage_threshold = atof(p_custom_lowv->getValue());
   if (p_custom_autolow) cfg.auto_low_enabled = (uint8_t)atoi(p_custom_autolow->getValue());
   if (p_custom_batint) cfg.battery_interval_s = (uint32_t)atoi(p_custom_batint->getValue());
   if (p_custom_batdelt) cfg.battery_delta = atof(p_custom_batdelt->getValue());
   saveConfig();
-
-  // Reconfigure MQTT with possibly updated settings
-  mqttClient.setServer(cfg.mqtt_host, cfg.mqtt_port);
 
   // Rebuild topics and (re)subscribe
   setupTopics();
@@ -398,31 +389,20 @@ void setup() {
     // This will be called when WiFiManager saves new WiFi credentials
   });
 
-  // Add custom parameters for MQTT and calibration
+  // Add custom parameters for calibration (MQTT is now hardcoded)
   // Allocate WiFiManagerParameter objects on the heap so they remain valid after setup()
-  char portbuf[8]; sprintf(portbuf, "%u", cfg.mqtt_port);
   char vdbuf[16]; dtostrf(cfg.voltage_divider, 4, 2, vdbuf);
   char lowvbuf[8]; dtostrf(cfg.low_voltage_threshold, 4, 2, lowvbuf);
   char autolowbuf[4]; sprintf(autolowbuf, "%u", cfg.auto_low_enabled);
   char batintbuf[8]; sprintf(batintbuf, "%u", (unsigned)cfg.battery_interval_s);
   char batdeltbuf[8]; dtostrf(cfg.battery_delta, 4, 2, batdeltbuf);
 
-  p_custom_mqtt_host = new WiFiManagerParameter("host", "MQTT Host", cfg.mqtt_host, 64);
-  p_custom_mqtt_port = new WiFiManagerParameter("port", "MQTT Port", portbuf, 6);
-  p_custom_mqtt_user = new WiFiManagerParameter("muser", "MQTT User", cfg.mqtt_user, 32);
-  p_custom_mqtt_pass = new WiFiManagerParameter("mpass", "MQTT Pass", cfg.mqtt_pass, 32);
-  p_custom_base_topic = new WiFiManagerParameter("topic", "Base Topic", cfg.base_topic, 32);
   p_custom_vdiv = new WiFiManagerParameter("vdiv", "Voltage Multiplier", vdbuf, 16);
   p_custom_lowv = new WiFiManagerParameter("lowv", "Low Voltage Threshold", lowvbuf, 8);
   p_custom_autolow = new WiFiManagerParameter("autolow", "Auto PRECOND on Low (1/0)", autolowbuf, 4);
   p_custom_batint = new WiFiManagerParameter("batint", "Battery interval (s)", batintbuf, 8);
   p_custom_batdelt = new WiFiManagerParameter("batd", "Battery delta (V)", batdeltbuf, 8);
 
-  wifiManager.addParameter(p_custom_mqtt_host);
-  wifiManager.addParameter(p_custom_mqtt_port);
-  wifiManager.addParameter(p_custom_mqtt_user);
-  wifiManager.addParameter(p_custom_mqtt_pass);
-  wifiManager.addParameter(p_custom_base_topic);
   wifiManager.addParameter(p_custom_vdiv);
   wifiManager.addParameter(p_custom_lowv);
   wifiManager.addParameter(p_custom_autolow);
@@ -445,12 +425,7 @@ void setup() {
     wifiManager.autoConnect("Heater-Setup-AP", DEFAULT_WIFI_PASS);
   }
 
-  // On success, copy back settings from persistent parameters
-  if (p_custom_mqtt_host) strncpy(cfg.mqtt_host, p_custom_mqtt_host->getValue(), sizeof(cfg.mqtt_host));
-  if (p_custom_mqtt_port) cfg.mqtt_port = atoi(p_custom_mqtt_port->getValue());
-  if (p_custom_mqtt_user) strncpy(cfg.mqtt_user, p_custom_mqtt_user->getValue(), sizeof(cfg.mqtt_user));
-  if (p_custom_mqtt_pass) strncpy(cfg.mqtt_pass, p_custom_mqtt_pass->getValue(), sizeof(cfg.mqtt_pass));
-  if (p_custom_base_topic) strncpy(cfg.base_topic, p_custom_base_topic->getValue(), sizeof(cfg.base_topic));
+  // On success, copy back settings from persistent parameters (calibration only)
   if (p_custom_vdiv) cfg.voltage_divider = atof(p_custom_vdiv->getValue());
   if (p_custom_lowv) cfg.low_voltage_threshold = atof(p_custom_lowv->getValue());
   if (p_custom_autolow) cfg.auto_low_enabled = (uint8_t)atoi(p_custom_autolow->getValue());
@@ -458,8 +433,13 @@ void setup() {
   if (p_custom_batdelt) cfg.battery_delta = atof(p_custom_batdelt->getValue());
   saveConfig();
 
-  mqttClient.setServer(cfg.mqtt_host, cfg.mqtt_port);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(onMqttMessage);
+
+  // Wait a moment for WiFi to stabilize
+  delay(2000);
+  Serial.printf("WiFi Status: %d (0=connected)\n", WiFi.status());
+  Serial.printf("WiFi IP: %s\n", WiFi.localIP().toString().c_str());
 
   // Setup web server for settings portal access
   webServer.on("/", handleRoot);
