@@ -4,6 +4,7 @@
 #include <PubSubClient.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <ESP8266WebServer.h>
 
 // Pin mapping (Wemos D1 mini labels)
 const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
@@ -45,6 +46,20 @@ const uint32_t CONFIG_MAGIC = 0xDEADBEEF;
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+ESP8266WebServer webServer(80);
+WiFiManager wifiManager;
+
+// Persistent pointers to WiFiManagerParameter objects so they stay valid after setup()
+WiFiManagerParameter *p_custom_mqtt_host = nullptr;
+WiFiManagerParameter *p_custom_mqtt_port = nullptr;
+WiFiManagerParameter *p_custom_mqtt_user = nullptr;
+WiFiManagerParameter *p_custom_mqtt_pass = nullptr;
+WiFiManagerParameter *p_custom_base_topic = nullptr;
+WiFiManagerParameter *p_custom_vdiv = nullptr;
+WiFiManagerParameter *p_custom_lowv = nullptr;
+WiFiManagerParameter *p_custom_autolow = nullptr;
+WiFiManagerParameter *p_custom_batint = nullptr;
+WiFiManagerParameter *p_custom_batdelt = nullptr;
 
 // runtime state
 bool relay1_state = false; // LIGHT
@@ -52,6 +67,7 @@ bool relay2_state = false; // READY
 bool relay3_state = false; // HORN
 bool relay4_state = false; // ACC
 bool precondition_state = false;
+bool portal_requested = false; // flag to request settings portal
 
 // Precondition timers and state machine
 unsigned long precond_on_until = 0; // millis until which precondition auto-on stays
@@ -105,7 +121,7 @@ void loadConfig() {
     strncpy(cfg.base_topic, DEFAULT_BASE_TOPIC, sizeof(cfg.base_topic));
     cfg.voltage_divider = 12.0; // default multiplier; adjust in portal
     cfg.low_voltage_threshold = 10.5;
-    cfg.auto_low_enabled = 1;
+    cfg.auto_low_enabled = 0; // default: disable auto precondition on low battery
     cfg.battery_interval_s = 60; // default publish every 60s
     cfg.battery_delta = 0.10; // default publish only if change >= 0.1V
     cfg.magic = CONFIG_MAGIC;
@@ -140,6 +156,7 @@ void setupTopics() {
   mqttClient.subscribe(topic_relay4_cmd.c_str());
   mqttClient.subscribe(topic_precondition_cmd.c_str());
   mqttClient.subscribe(topic_auto_low_cmd.c_str());
+  mqttClient.subscribe((topic_base + "/settings/set").c_str());
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -188,6 +205,14 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     cfg.auto_low_enabled = newState ? 1 : 0;
     saveConfig();
     if (mqttClient.connected()) mqttClient.publish(topic_auto_low_state.c_str(), cfg.auto_low_enabled ? "ON" : "OFF", true);
+  }
+  // Settings portal trigger via MQTT
+  if (t == topic_base + "/settings/set") {
+    bool enable = (msg.equalsIgnoreCase("on") || msg == "1" || msg.equalsIgnoreCase("true"));
+    if (enable) {
+      portal_requested = true;
+      Serial.println("Settings portal requested via MQTT");
+    }
   }
 }
 
@@ -265,6 +290,64 @@ void publishHADiscovery() {
   mqttClient.publish(disc_batt.c_str(), buf2, false);
 }
 
+// Web server handler for settings portal trigger
+void handlePortalRequest() {
+  portal_requested = true;
+  webServer.send(200, "text/plain", "Settings portal will start in a few seconds. Connect to 'Heater-Setup-AP' WiFi network.");
+}
+
+// Web server handler for root
+void handleRoot() {
+  String html = "<html><head><title>Heater Settings</title></head><body>";
+  html += "<h1>Heater Control</h1>";
+  html += "<p><a href='/settings'>Open Settings Portal</a></p>";
+  html += "<p>Device IP: " + WiFi.localIP().toString() + "</p>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+// Start settings portal
+void startSettingsPortal() {
+  Serial.println("Starting settings portal...");
+  // Stop our own web server to avoid port conflicts with WiFiManager's captive portal
+  webServer.stop();
+  // Disable portal timeout (0 = no timeout) so it stays available until user finishes
+  wifiManager.setConfigPortalTimeout(0);
+  // Stop MQTT client to free resources while in portal
+  // Note: mqttClient.disconnect() will be called if connected; reconnect after portal
+  if (mqttClient.connected()) mqttClient.disconnect();
+
+  bool res = wifiManager.startConfigPortal("Heater-Setup-AP", DEFAULT_WIFI_PASS);
+  Serial.printf("Config portal finished, result=%d\n", res ? 1 : 0);
+
+  // After portal exits, copy any changed parameters back into cfg (parameters are persistent)
+  if (p_custom_mqtt_host) strncpy(cfg.mqtt_host, p_custom_mqtt_host->getValue(), sizeof(cfg.mqtt_host));
+  if (p_custom_mqtt_port) cfg.mqtt_port = atoi(p_custom_mqtt_port->getValue());
+  if (p_custom_mqtt_user) strncpy(cfg.mqtt_user, p_custom_mqtt_user->getValue(), sizeof(cfg.mqtt_user));
+  if (p_custom_mqtt_pass) strncpy(cfg.mqtt_pass, p_custom_mqtt_pass->getValue(), sizeof(cfg.mqtt_pass));
+  if (p_custom_base_topic) strncpy(cfg.base_topic, p_custom_base_topic->getValue(), sizeof(cfg.base_topic));
+  if (p_custom_vdiv) cfg.voltage_divider = atof(p_custom_vdiv->getValue());
+  if (p_custom_lowv) cfg.low_voltage_threshold = atof(p_custom_lowv->getValue());
+  if (p_custom_autolow) cfg.auto_low_enabled = (uint8_t)atoi(p_custom_autolow->getValue());
+  if (p_custom_batint) cfg.battery_interval_s = (uint32_t)atoi(p_custom_batint->getValue());
+  if (p_custom_batdelt) cfg.battery_delta = atof(p_custom_batdelt->getValue());
+  saveConfig();
+
+  // Reconfigure MQTT with possibly updated settings
+  mqttClient.setServer(cfg.mqtt_host, cfg.mqtt_port);
+
+  // Rebuild topics and (re)subscribe
+  setupTopics();
+
+  // Restart our web server so the device UI is accessible on new network mode
+  webServer.begin();
+  Serial.println("Web server restarted on port 80");
+  // Try to reconnect to MQTT with new settings
+  mqttReconnect();
+
+  portal_requested = false;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(100);
@@ -280,39 +363,40 @@ void setup() {
 
   loadConfig();
 
-  WiFiManager wifiManager;
   wifiManager.setSaveConfigCallback([](){
     // This will be called when WiFiManager saves new WiFi credentials
   });
 
   // Add custom parameters for MQTT and calibration
-  WiFiManagerParameter custom_mqtt_host("host", "MQTT Host", cfg.mqtt_host, 64);
+  // Allocate WiFiManagerParameter objects on the heap so they remain valid after setup()
   char portbuf[8]; sprintf(portbuf, "%u", cfg.mqtt_port);
-  WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", portbuf, 6);
-  WiFiManagerParameter custom_mqtt_user("muser", "MQTT User", cfg.mqtt_user, 32);
-  WiFiManagerParameter custom_mqtt_pass("mpass", "MQTT Pass", cfg.mqtt_pass, 32);
-  WiFiManagerParameter custom_base_topic("topic", "Base Topic", cfg.base_topic, 32);
   char vdbuf[16]; dtostrf(cfg.voltage_divider, 4, 2, vdbuf);
-  WiFiManagerParameter custom_vdiv("vdiv", "Voltage Multiplier", vdbuf, 16);
   char lowvbuf[8]; dtostrf(cfg.low_voltage_threshold, 4, 2, lowvbuf);
-  WiFiManagerParameter custom_lowv("lowv", "Low Voltage Threshold", lowvbuf, 8);
   char autolowbuf[4]; sprintf(autolowbuf, "%u", cfg.auto_low_enabled);
-  WiFiManagerParameter custom_autolow("autolow", "Auto PRECOND on Low (1/0)", autolowbuf, 4);
   char batintbuf[8]; sprintf(batintbuf, "%u", (unsigned)cfg.battery_interval_s);
   char batdeltbuf[8]; dtostrf(cfg.battery_delta, 4, 2, batdeltbuf);
-  WiFiManagerParameter custom_batint("batint", "Battery interval (s)", batintbuf, 8);
-  WiFiManagerParameter custom_batdelt("batd", "Battery delta (V)", batdeltbuf, 8);
 
-  wifiManager.addParameter(&custom_mqtt_host);
-  wifiManager.addParameter(&custom_mqtt_port);
-  wifiManager.addParameter(&custom_mqtt_user);
-  wifiManager.addParameter(&custom_mqtt_pass);
-  wifiManager.addParameter(&custom_base_topic);
-  wifiManager.addParameter(&custom_vdiv);
-  wifiManager.addParameter(&custom_lowv);
-  wifiManager.addParameter(&custom_autolow);
-  wifiManager.addParameter(&custom_batint);
-  wifiManager.addParameter(&custom_batdelt);
+  p_custom_mqtt_host = new WiFiManagerParameter("host", "MQTT Host", cfg.mqtt_host, 64);
+  p_custom_mqtt_port = new WiFiManagerParameter("port", "MQTT Port", portbuf, 6);
+  p_custom_mqtt_user = new WiFiManagerParameter("muser", "MQTT User", cfg.mqtt_user, 32);
+  p_custom_mqtt_pass = new WiFiManagerParameter("mpass", "MQTT Pass", cfg.mqtt_pass, 32);
+  p_custom_base_topic = new WiFiManagerParameter("topic", "Base Topic", cfg.base_topic, 32);
+  p_custom_vdiv = new WiFiManagerParameter("vdiv", "Voltage Multiplier", vdbuf, 16);
+  p_custom_lowv = new WiFiManagerParameter("lowv", "Low Voltage Threshold", lowvbuf, 8);
+  p_custom_autolow = new WiFiManagerParameter("autolow", "Auto PRECOND on Low (1/0)", autolowbuf, 4);
+  p_custom_batint = new WiFiManagerParameter("batint", "Battery interval (s)", batintbuf, 8);
+  p_custom_batdelt = new WiFiManagerParameter("batd", "Battery delta (V)", batdeltbuf, 8);
+
+  wifiManager.addParameter(p_custom_mqtt_host);
+  wifiManager.addParameter(p_custom_mqtt_port);
+  wifiManager.addParameter(p_custom_mqtt_user);
+  wifiManager.addParameter(p_custom_mqtt_pass);
+  wifiManager.addParameter(p_custom_base_topic);
+  wifiManager.addParameter(p_custom_vdiv);
+  wifiManager.addParameter(p_custom_lowv);
+  wifiManager.addParameter(p_custom_autolow);
+  wifiManager.addParameter(p_custom_batint);
+  wifiManager.addParameter(p_custom_batdelt);
 
   // Start portal if no WiFi credentials
   // Try to connect using built-in default WiFi credentials first
@@ -330,27 +414,44 @@ void setup() {
     wifiManager.autoConnect("Heater-Setup-AP", DEFAULT_WIFI_PASS);
   }
 
-  // On success, copy back settings
-  strncpy(cfg.mqtt_host, custom_mqtt_host.getValue(), sizeof(cfg.mqtt_host));
-  cfg.mqtt_port = atoi(custom_mqtt_port.getValue());
-  strncpy(cfg.mqtt_user, custom_mqtt_user.getValue(), sizeof(cfg.mqtt_user));
-  strncpy(cfg.mqtt_pass, custom_mqtt_pass.getValue(), sizeof(cfg.mqtt_pass));
-  strncpy(cfg.base_topic, custom_base_topic.getValue(), sizeof(cfg.base_topic));
-  cfg.voltage_divider = atof(custom_vdiv.getValue());
-  cfg.low_voltage_threshold = atof(custom_lowv.getValue());
-  cfg.auto_low_enabled = (uint8_t)atoi(custom_autolow.getValue());
-  cfg.battery_interval_s = (uint32_t)atoi(custom_batint.getValue());
-  cfg.battery_delta = atof(custom_batdelt.getValue());
+  // On success, copy back settings from persistent parameters
+  if (p_custom_mqtt_host) strncpy(cfg.mqtt_host, p_custom_mqtt_host->getValue(), sizeof(cfg.mqtt_host));
+  if (p_custom_mqtt_port) cfg.mqtt_port = atoi(p_custom_mqtt_port->getValue());
+  if (p_custom_mqtt_user) strncpy(cfg.mqtt_user, p_custom_mqtt_user->getValue(), sizeof(cfg.mqtt_user));
+  if (p_custom_mqtt_pass) strncpy(cfg.mqtt_pass, p_custom_mqtt_pass->getValue(), sizeof(cfg.mqtt_pass));
+  if (p_custom_base_topic) strncpy(cfg.base_topic, p_custom_base_topic->getValue(), sizeof(cfg.base_topic));
+  if (p_custom_vdiv) cfg.voltage_divider = atof(p_custom_vdiv->getValue());
+  if (p_custom_lowv) cfg.low_voltage_threshold = atof(p_custom_lowv->getValue());
+  if (p_custom_autolow) cfg.auto_low_enabled = (uint8_t)atoi(p_custom_autolow->getValue());
+  if (p_custom_batint) cfg.battery_interval_s = (uint32_t)atoi(p_custom_batint->getValue());
+  if (p_custom_batdelt) cfg.battery_delta = atof(p_custom_batdelt->getValue());
   saveConfig();
 
   mqttClient.setServer(cfg.mqtt_host, cfg.mqtt_port);
   mqttClient.setCallback(onMqttMessage);
+
+  // Setup web server for settings portal access
+  webServer.on("/", handleRoot);
+  webServer.on("/settings", handlePortalRequest);
+  webServer.begin();
+  Serial.println("Web server started on port 80");
+  Serial.printf("Access via http://%s or http://192.168.4.1\n", WiFi.localIP().toString().c_str());
 
   // initial topics will be prepared after WiFi connected
   setupTopics();
 }
 
 void loop() {
+  // Handle web server requests
+  webServer.handleClient();
+  
+  // Check if settings portal was requested
+  if (portal_requested) {
+    portal_requested = false;
+    delay(1000); // Give time for HTTP response to send
+    startSettingsPortal();
+  }
+  
   if (!mqttClient.connected()) {
     mqttReconnect();
   }
