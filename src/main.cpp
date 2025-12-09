@@ -107,7 +107,7 @@ void loadConfig() {
   if (cfg.magic != CONFIG_MAGIC) {
     // set defaults
     memset(&cfg, 0, sizeof(cfg));
-    cfg.voltage_divider = 12.0; // default multiplier; adjust in portal
+    cfg.voltage_divider = 24.0; // default multiplier; adjust in portal
     cfg.low_voltage_threshold = 10.5;
     cfg.auto_low_enabled = 0; // default: disable auto precondition on low battery
     cfg.battery_interval_s = 60; // default publish every 60s
