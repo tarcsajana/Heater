@@ -1,0 +1,411 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <EEPROM.h>
+#include <ArduinoJson.h>
+
+// Pin mapping (Wemos D1 mini labels)
+const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
+const uint8_t RELAY4_PIN = D5; // ACC (inverted)
+const uint8_t RELAY2_PIN = D7; // READY (inverted)
+const uint8_t RELAY3_PIN = D6; // HORN (inverted)
+
+// ADC pin
+#define ADC_PIN A0
+
+// Defaults
+const char* DEFAULT_MQTT_HOST = "kebnekaise.lmq.cloudamqp.com";
+const uint16_t DEFAULT_MQTT_PORT = 1883;
+const char* DEFAULT_BASE_TOPIC = "heater";
+// Default MQTT credentials
+const char* DEFAULT_MQTT_USER = "lpomtbnx:lpomtbnx";
+const char* DEFAULT_MQTT_PASS = "9htYKaGbPej2YOYyHYGZEbkWdpDdT0Mv";
+// Default WiFi credentials (device will attempt to connect to these before starting portal)
+const char* DEFAULT_WIFI_SSID = "HunorCar";
+const char* DEFAULT_WIFI_PASS = "Jucymucy8581";
+
+// EEPROM layout
+struct Config {
+  char mqtt_host[64];
+  uint16_t mqtt_port;
+  char mqtt_user[32];
+  char mqtt_pass[32];
+  char base_topic[32];
+  float voltage_divider; // multiply measured ADC voltage to get battery voltage
+  float low_voltage_threshold; // in volts
+  uint8_t auto_low_enabled; // 1 = enable auto precondition when below threshold
+  uint32_t battery_interval_s; // seconds between battery publishes
+  float battery_delta; // minimal change (V) to trigger publish
+  uint32_t magic; // marker to validate
+};
+
+Config cfg;
+const uint32_t CONFIG_MAGIC = 0xDEADBEEF;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// runtime state
+bool relay1_state = false; // LIGHT
+bool relay2_state = false; // READY
+bool relay3_state = false; // HORN
+bool relay4_state = false; // ACC
+bool precondition_state = false;
+
+// Precondition timers and state machine
+unsigned long precond_on_until = 0; // millis until which precondition auto-on stays
+unsigned long seq_step_until = 0;
+int seq_step = 0;
+
+// MQTT topics (built at setup)
+String topic_base;
+String topic_relay1_cmd, topic_relay1_state;
+String topic_relay2_cmd, topic_relay2_state;
+String topic_relay3_cmd, topic_relay3_state;
+String topic_relay4_cmd, topic_relay4_state;
+String topic_precondition_cmd, topic_precondition_state;
+String topic_battery_state;
+String topic_auto_low_cmd, topic_auto_low_state;
+
+// helper to write inverted relay pins (LOW = ON)
+void setRelay(uint8_t pin, bool on) {
+  digitalWrite(pin, on ? LOW : HIGH);
+}
+
+void publishState(const String &topic, bool state) {
+  if (mqttClient.connected()) {
+    mqttClient.publish(topic.c_str(), state ? "ON" : "OFF", true);
+  }
+}
+
+float readBatteryVoltage() {
+  int raw = analogRead(ADC_PIN);
+  // ADC raw 0..1023 corresponds to ADC reference ~1.0V on many Wemos boards
+  float adc_voltage = (raw / 1023.0) * 1.0; // measured input to ADC
+  return adc_voltage * cfg.voltage_divider;
+}
+
+void saveConfig() {
+  cfg.magic = CONFIG_MAGIC;
+  EEPROM.begin(512);
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+void loadConfig() {
+  EEPROM.begin(512);
+  EEPROM.get(0, cfg);
+  if (cfg.magic != CONFIG_MAGIC) {
+    // set defaults
+    strncpy(cfg.mqtt_host, DEFAULT_MQTT_HOST, sizeof(cfg.mqtt_host));
+    cfg.mqtt_port = DEFAULT_MQTT_PORT;
+    strncpy(cfg.mqtt_user, DEFAULT_MQTT_USER, sizeof(cfg.mqtt_user));
+    strncpy(cfg.mqtt_pass, DEFAULT_MQTT_PASS, sizeof(cfg.mqtt_pass));
+    strncpy(cfg.base_topic, DEFAULT_BASE_TOPIC, sizeof(cfg.base_topic));
+    cfg.voltage_divider = 12.0; // default multiplier; adjust in portal
+    cfg.low_voltage_threshold = 10.5;
+    cfg.auto_low_enabled = 1;
+    cfg.battery_interval_s = 60; // default publish every 60s
+    cfg.battery_delta = 0.10; // default publish only if change >= 0.1V
+    cfg.magic = CONFIG_MAGIC;
+    saveConfig();
+  }
+}
+
+// Build topics and setup mqtt subscriptions
+void setupTopics() {
+  String node = WiFi.macAddress();
+  node.replace(":", "");
+  topic_base = String(cfg.base_topic) + "/" + node;
+
+  topic_relay1_cmd = topic_base + "/relay1/set";
+  topic_relay1_state = topic_base + "/relay1/state";
+  topic_relay2_cmd = topic_base + "/relay2/set";
+  topic_relay2_state = topic_base + "/relay2/state";
+  topic_relay3_cmd = topic_base + "/relay3/set";
+  topic_relay3_state = topic_base + "/relay3/state";
+  topic_relay4_cmd = topic_base + "/relay4/set";
+  topic_relay4_state = topic_base + "/relay4/state";
+
+  topic_precondition_cmd = topic_base + "/precondition/set";
+  topic_precondition_state = topic_base + "/precondition/state";
+  topic_battery_state = topic_base + "/battery";
+  topic_auto_low_cmd = topic_base + "/auto_low/set";
+  topic_auto_low_state = topic_base + "/auto_low/state";
+
+  mqttClient.subscribe(topic_relay1_cmd.c_str());
+  mqttClient.subscribe(topic_relay2_cmd.c_str());
+  mqttClient.subscribe(topic_relay3_cmd.c_str());
+  mqttClient.subscribe(topic_relay4_cmd.c_str());
+  mqttClient.subscribe(topic_precondition_cmd.c_str());
+  mqttClient.subscribe(topic_auto_low_cmd.c_str());
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  auto handleToggle = [&](String const &t_on, bool &state, uint8_t pin, const String &stateTopic){
+    if (t == t_on) {
+      bool newState = (msg.equalsIgnoreCase("on") || msg == "1" || msg.equalsIgnoreCase("true"));
+      state = newState;
+      setRelay(pin, state);
+      publishState(stateTopic, state);
+    }
+  };
+
+  handleToggle(topic_relay1_cmd, relay1_state, RELAY1_PIN, topic_relay1_state);
+  handleToggle(topic_relay2_cmd, relay2_state, RELAY2_PIN, topic_relay2_state);
+  handleToggle(topic_relay3_cmd, relay3_state, RELAY3_PIN, topic_relay3_state);
+  handleToggle(topic_relay4_cmd, relay4_state, RELAY4_PIN, topic_relay4_state);
+
+  if (t == topic_precondition_cmd) {
+    bool newState = (msg.equalsIgnoreCase("on") || msg == "1" || msg.equalsIgnoreCase("true"));
+    if (newState && !precondition_state) {
+      // start the sequence
+      precondition_state = true;
+      publishState(topic_precondition_state, true);
+      // ACC ON immediately
+      relay4_state = true; setRelay(RELAY4_PIN, true); publishState(topic_relay4_state, true);
+      // schedule READY after 3s
+      seq_step = 1;
+      seq_step_until = millis() + 3000UL;
+    } else if (!newState && precondition_state) {
+      // stop precondition: turn ACC off
+      precondition_state = false;
+      relay4_state = false; setRelay(RELAY4_PIN, false); publishState(topic_relay4_state, false);
+      publishState(topic_precondition_state, false);
+      // cancel sequence
+      seq_step = 0; seq_step_until = 0;
+      precond_on_until = 0;
+    }
+  }
+  if (t == topic_auto_low_cmd) {
+    bool newState = (msg.equalsIgnoreCase("on") || msg == "1" || msg.equalsIgnoreCase("true"));
+    cfg.auto_low_enabled = newState ? 1 : 0;
+    saveConfig();
+    if (mqttClient.connected()) mqttClient.publish(topic_auto_low_state.c_str(), cfg.auto_low_enabled ? "ON" : "OFF", true);
+  }
+}
+
+// forward declaration
+void publishHADiscovery();
+
+void mqttReconnect() {
+  static unsigned long last_mqtt_attempt = 0;
+  static bool ha_discovery_published = false;
+  if (mqttClient.connected()) return;
+  if (millis() - last_mqtt_attempt < 5000UL) return; // backoff: try at most once every 5s
+  last_mqtt_attempt = millis();
+
+  if (strlen(cfg.mqtt_user) > 0) {
+    mqttClient.connect("heater-client", cfg.mqtt_user, cfg.mqtt_pass);
+  } else {
+    mqttClient.connect("heater-client");
+  }
+  if (mqttClient.connected()) {
+    setupTopics();
+    // publish retained initial states
+    publishState(topic_relay1_state, relay1_state);
+    publishState(topic_relay2_state, relay2_state);
+    publishState(topic_relay3_state, relay3_state);
+    publishState(topic_relay4_state, relay4_state);
+    publishState(topic_precondition_state, precondition_state);
+    mqttClient.publish(topic_auto_low_state.c_str(), cfg.auto_low_enabled ? "ON" : "OFF", true);
+    // Publish HA discovery only once per boot (avoid repeated discovery on reconnects)
+    if (!ha_discovery_published) {
+      publishHADiscovery();
+      ha_discovery_published = true;
+    }
+  }
+  }
+
+// Create Home Assistant discovery payloads
+void publishHADiscovery() {
+  if (!mqttClient.connected()) return;
+  String node = WiFi.macAddress(); node.replace(":", "");
+  // Relay mappings per user request:
+  // relay4 = ACC, relay2 = READY, relay3 = HORN, relay1 = LIGHT
+
+  // helper
+  auto publishSwitch = [&](const String &obj_id, const String &name, const String &cmd_topic, const String &state_topic){
+    String disc = String("homeassistant/switch/") + node + "/" + obj_id + "/config";
+    StaticJsonDocument<512> doc;
+    doc["name"] = name;
+    doc["uniq_id"] = node + "_" + obj_id;
+    doc["cmd_t"] = cmd_topic;
+    doc["stat_t"] = state_topic;
+    doc["qos"] = 0;
+    doc["pl_on"] = "ON";
+    doc["pl_off"] = "OFF";
+    char buf[512];
+    serializeJson(doc, buf);
+    mqttClient.publish(disc.c_str(), buf, false);
+  };
+
+  publishSwitch("acc", "ACC", topic_relay4_cmd, topic_relay4_state);
+  publishSwitch("ready", "READY", topic_relay2_cmd, topic_relay2_state);
+  publishSwitch("horn", "HORN", topic_relay3_cmd, topic_relay3_state);
+  publishSwitch("light", "LIGHT", topic_relay1_cmd, topic_relay1_state);
+  publishSwitch("precondition", "PRECONDITION", topic_precondition_cmd, topic_precondition_state);
+  publishSwitch("auto_low", "Auto PRECOND Low", topic_auto_low_cmd, topic_auto_low_state);
+
+  // battery sensor
+  String disc_batt = String("homeassistant/sensor/") + node + "/battery/config";
+  StaticJsonDocument<256> doc2;
+  doc2["name"] = "Heater Battery";
+  doc2["uniq_id"] = node + String("_battery");
+  doc2["stat_t"] = topic_battery_state;
+  doc2["unit_of_meas"] = "V";
+  doc2["device_class"] = "voltage";
+  char buf2[256]; serializeJson(doc2, buf2);
+  mqttClient.publish(disc_batt.c_str(), buf2, false);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+  pinMode(RELAY4_PIN, OUTPUT);
+  // default off (remember inverted)
+  setRelay(RELAY1_PIN, false);
+  setRelay(RELAY2_PIN, false);
+  setRelay(RELAY3_PIN, false);
+  setRelay(RELAY4_PIN, false);
+
+  loadConfig();
+
+  WiFiManager wifiManager;
+  wifiManager.setSaveConfigCallback([](){
+    // This will be called when WiFiManager saves new WiFi credentials
+  });
+
+  // Add custom parameters for MQTT and calibration
+  WiFiManagerParameter custom_mqtt_host("host", "MQTT Host", cfg.mqtt_host, 64);
+  char portbuf[8]; sprintf(portbuf, "%u", cfg.mqtt_port);
+  WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", portbuf, 6);
+  WiFiManagerParameter custom_mqtt_user("muser", "MQTT User", cfg.mqtt_user, 32);
+  WiFiManagerParameter custom_mqtt_pass("mpass", "MQTT Pass", cfg.mqtt_pass, 32);
+  WiFiManagerParameter custom_base_topic("topic", "Base Topic", cfg.base_topic, 32);
+  char vdbuf[16]; dtostrf(cfg.voltage_divider, 4, 2, vdbuf);
+  WiFiManagerParameter custom_vdiv("vdiv", "Voltage Multiplier", vdbuf, 16);
+  char lowvbuf[8]; dtostrf(cfg.low_voltage_threshold, 4, 2, lowvbuf);
+  WiFiManagerParameter custom_lowv("lowv", "Low Voltage Threshold", lowvbuf, 8);
+  char autolowbuf[4]; sprintf(autolowbuf, "%u", cfg.auto_low_enabled);
+  WiFiManagerParameter custom_autolow("autolow", "Auto PRECOND on Low (1/0)", autolowbuf, 4);
+  char batintbuf[8]; sprintf(batintbuf, "%u", (unsigned)cfg.battery_interval_s);
+  char batdeltbuf[8]; dtostrf(cfg.battery_delta, 4, 2, batdeltbuf);
+  WiFiManagerParameter custom_batint("batint", "Battery interval (s)", batintbuf, 8);
+  WiFiManagerParameter custom_batdelt("batd", "Battery delta (V)", batdeltbuf, 8);
+
+  wifiManager.addParameter(&custom_mqtt_host);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_mqtt_user);
+  wifiManager.addParameter(&custom_mqtt_pass);
+  wifiManager.addParameter(&custom_base_topic);
+  wifiManager.addParameter(&custom_vdiv);
+  wifiManager.addParameter(&custom_lowv);
+  wifiManager.addParameter(&custom_autolow);
+  wifiManager.addParameter(&custom_batint);
+  wifiManager.addParameter(&custom_batdelt);
+
+  // Start portal if no WiFi credentials
+  // Try to connect using built-in default WiFi credentials first
+  if (strlen(DEFAULT_WIFI_SSID) > 0) {
+    Serial.printf("Trying default WiFi '%s'...\n", DEFAULT_WIFI_SSID);
+    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000UL) {
+      delay(500);
+    }
+  }
+
+  // If not connected, start configuration portal
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiManager.autoConnect("Heater-Setup-AP", DEFAULT_WIFI_PASS);
+  }
+
+  // On success, copy back settings
+  strncpy(cfg.mqtt_host, custom_mqtt_host.getValue(), sizeof(cfg.mqtt_host));
+  cfg.mqtt_port = atoi(custom_mqtt_port.getValue());
+  strncpy(cfg.mqtt_user, custom_mqtt_user.getValue(), sizeof(cfg.mqtt_user));
+  strncpy(cfg.mqtt_pass, custom_mqtt_pass.getValue(), sizeof(cfg.mqtt_pass));
+  strncpy(cfg.base_topic, custom_base_topic.getValue(), sizeof(cfg.base_topic));
+  cfg.voltage_divider = atof(custom_vdiv.getValue());
+  cfg.low_voltage_threshold = atof(custom_lowv.getValue());
+  cfg.auto_low_enabled = (uint8_t)atoi(custom_autolow.getValue());
+  cfg.battery_interval_s = (uint32_t)atoi(custom_batint.getValue());
+  cfg.battery_delta = atof(custom_batdelt.getValue());
+  saveConfig();
+
+  mqttClient.setServer(cfg.mqtt_host, cfg.mqtt_port);
+  mqttClient.setCallback(onMqttMessage);
+
+  // initial topics will be prepared after WiFi connected
+  setupTopics();
+}
+
+void loop() {
+  if (!mqttClient.connected()) {
+    mqttReconnect();
+  }
+  mqttClient.loop();
+
+  // handle precondition sequence state machine
+  if (seq_step == 1 && millis() >= seq_step_until) {
+    // turn READY on
+    relay2_state = true; setRelay(RELAY2_PIN, true); publishState(topic_relay2_state, true);
+    // schedule next step: READY off after 2s
+    seq_step = 2; seq_step_until = millis() + 2000UL;
+  } else if (seq_step == 2 && millis() >= seq_step_until) {
+    // turn READY off
+    relay2_state = false; setRelay(RELAY2_PIN, false); publishState(topic_relay2_state, false);
+    seq_step = 0; seq_step_until = 0;
+  }
+
+  // Precondition auto-off timer
+  if (precond_on_until != 0 && millis() > precond_on_until) {
+    // time expired
+    precondition_state = false;
+    precond_on_until = 0;
+    // turn ACC off
+    relay4_state = false; setRelay(RELAY4_PIN, false); publishState(topic_relay4_state, false);
+    publishState(topic_precondition_state, false);
+  }
+
+  // Battery measurement at configurable interval; publish only on significant change
+  static unsigned long lastBat = 0;
+  static float lastPublishedBattery = 0.0;
+  static bool firstBatPub = true;
+  unsigned long batIntervalMs = (cfg.battery_interval_s > 0) ? (cfg.battery_interval_s * 1000UL) : 60000UL;
+  if (millis() - lastBat > batIntervalMs) {
+    lastBat = millis();
+    float batt = readBatteryVoltage();
+    float diff = batt - lastPublishedBattery;
+    if (diff < 0) diff = -diff;
+    bool shouldPublish = firstBatPub || (diff >= cfg.battery_delta);
+    if (shouldPublish && mqttClient.connected()) {
+      char buf[16]; dtostrf(batt, 4, 2, buf);
+      mqttClient.publish(topic_battery_state.c_str(), buf, true);
+      lastPublishedBattery = batt;
+      firstBatPub = false;
+    }
+
+    // if below threshold and precondition not active and auto-low is enabled, enable for 20 minutes
+    if (cfg.auto_low_enabled && batt < cfg.low_voltage_threshold && !precondition_state) {
+      precondition_state = true;
+      publishState(topic_precondition_state, true);
+      // ACC on immediately
+      relay4_state = true; setRelay(RELAY4_PIN, true); publishState(topic_relay4_state, true);
+      // schedule READY after 3s
+      seq_step = 1; seq_step_until = millis() + 3000UL;
+      // schedule auto-off after 20 minutes
+      precond_on_until = millis() + 20UL * 60UL * 1000UL;
+    }
+  }
+}
