@@ -222,14 +222,42 @@ void publishHADiscovery();
 void mqttReconnect() {
   static unsigned long last_mqtt_attempt = 0;
   static bool ha_discovery_published = false;
+  // helper to convert state codes
+  auto mqttStateToString = [](int8_t s)->const char* {
+    switch(s) {
+      case -4: return "MQTT_CONNECTION_TIMEOUT";
+      case -3: return "MQTT_CONNECTION_LOST";
+      case -2: return "MQTT_CONNECT_FAILED";
+      case -1: return "MQTT_DISCONNECTED";
+      case 0: return "MQTT_CONNECTED";
+      case 1: return "MQTT_CONNECT_BAD_PROTOCOL";
+      case 2: return "MQTT_CONNECT_BAD_CLIENT_ID";
+      case 3: return "MQTT_CONNECT_UNAVAILABLE";
+      case 4: return "MQTT_CONNECT_BAD_CREDENTIALS";
+      case 5: return "MQTT_CONNECT_UNAUTHORIZED";
+      default: return "MQTT_UNKNOWN";
+    }
+  };
   if (mqttClient.connected()) return;
   if (millis() - last_mqtt_attempt < 5000UL) return; // backoff: try at most once every 5s
   last_mqtt_attempt = millis();
 
+  // build a unique client id from MAC
+  String nodeId = WiFi.macAddress(); nodeId.replace(":", "");
+  String clientId = String("heater-") + nodeId;
+  Serial.printf("Attempting MQTT connect to %s:%u as %s\n", cfg.mqtt_host, cfg.mqtt_port, clientId.c_str());
+  bool ok;
   if (strlen(cfg.mqtt_user) > 0) {
-    mqttClient.connect("heater-client", cfg.mqtt_user, cfg.mqtt_pass);
+    ok = mqttClient.connect(clientId.c_str(), cfg.mqtt_user, cfg.mqtt_pass);
   } else {
-    mqttClient.connect("heater-client");
+    ok = mqttClient.connect(clientId.c_str());
+  }
+  if (!ok) {
+    int8_t st = mqttClient.state();
+    Serial.printf("MQTT connect failed: %d (%s)\n", st, mqttStateToString(st));
+    // publish an offline status to broker if possible (may fail if not connected)
+    // attempt a short non-blocking publish by connecting without auth if broker allows
+    return;
   }
   if (mqttClient.connected()) {
     setupTopics();
@@ -240,6 +268,9 @@ void mqttReconnect() {
     publishState(topic_relay4_state, relay4_state);
     publishState(topic_precondition_state, precondition_state);
     mqttClient.publish(topic_auto_low_state.c_str(), cfg.auto_low_enabled ? "ON" : "OFF", true);
+    // publish online status retained
+    String status_topic = topic_base + "/status";
+    mqttClient.publish(status_topic.c_str(), "online", true);
     // Publish HA discovery only once per boot (avoid repeated discovery on reconnects)
     if (!ha_discovery_published) {
       publishHADiscovery();
