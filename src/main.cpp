@@ -66,6 +66,9 @@ unsigned long precond_on_until = 0; // millis until which precondition auto-on s
 unsigned long seq_step_until = 0;
 int seq_step = 0;
 
+// Relay3 (HORN) auto-off timer
+unsigned long relay3_off_at = 0;
+
 // MQTT topics (built at setup)
 String topic_base;
 String topic_relay1_cmd, topic_relay1_state;
@@ -164,7 +167,19 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   handleToggle(topic_relay1_cmd, relay1_state, RELAY1_PIN, topic_relay1_state);
   handleToggle(topic_relay2_cmd, relay2_state, RELAY2_PIN, topic_relay2_state);
-  handleToggle(topic_relay3_cmd, relay3_state, RELAY3_PIN, topic_relay3_state);
+  
+  // Relay3 (HORN) with auto-off after 0.5s
+  if (t == topic_relay3_cmd) {
+    bool newState = (msg.equalsIgnoreCase("on") || msg == "1" || msg.equalsIgnoreCase("true"));
+    relay3_state = newState;
+    setRelay(RELAY3_PIN, relay3_state);
+    publishState(topic_relay3_state, relay3_state);
+    if (relay3_state) {
+      // Schedule auto-off after 500ms
+      relay3_off_at = millis() + 500UL;
+    }
+  }
+  
   handleToggle(topic_relay4_cmd, relay4_state, RELAY4_PIN, topic_relay4_state);
 
   if (t == topic_precondition_cmd) {
@@ -467,6 +482,14 @@ void loop() {
     mqttReconnect();
   }
   mqttClient.loop();
+
+  // Relay3 (HORN) auto-off after 0.5s
+  if (relay3_off_at != 0 && millis() >= relay3_off_at) {
+    relay3_state = false;
+    setRelay(RELAY3_PIN, false);
+    publishState(topic_relay3_state, false);
+    relay3_off_at = 0;
+  }
 
   // handle precondition sequence state machine
   if (seq_step == 1 && millis() >= seq_step_until) {
