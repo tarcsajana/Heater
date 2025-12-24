@@ -5,6 +5,8 @@
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
+#include <time.h>
+#include <cmath>
 
 // Pin mapping (Wemos D1 mini labels)
 const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
@@ -14,6 +16,14 @@ const uint8_t RELAY3_PIN = D6; // HORN (inverted)
 
 // ADC pin
 #define ADC_PIN A0
+
+// Sun automation for OSLO, Norway
+const double OSLO_LATITUDE = 59.9139;  // N
+const double OSLO_LONGITUDE = 10.7522; // E
+bool sun_automation_enabled = true;
+bool is_dark_now = false;
+unsigned long last_sun_check = 0;
+const unsigned long SUN_CHECK_INTERVAL = 60000; // check every minute
 
 // Defaults
 const char* MQTT_HOST = "kebnekaise.lmq.cloudamqp.com";
@@ -82,6 +92,94 @@ String topic_auto_low_cmd, topic_auto_low_state;
 // helper to write inverted relay pins (LOW = ON)
 void setRelay(uint8_t pin, bool on) {
   digitalWrite(pin, on ? LOW : HIGH);
+}
+
+// Check if sun is down (before sunrise or after sunset)
+// NOAA algorithm for sunrise/sunset calculation
+bool isSunDown() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  
+  int year = timeinfo->tm_year + 1900;
+  int month = timeinfo->tm_mon + 1;
+  int day = timeinfo->tm_mday;
+  int hour = timeinfo->tm_hour;
+  int minute = timeinfo->tm_min;
+  
+  // Calculate day of year
+  int N1 = floor(275 * month / 9);
+  int N2 = floor((month + 9) / 12);
+  int N3 = (1 + floor((year - 4 * floor(year / 4) + 2) / 3));
+  int dayOfYear = N1 - (N2 * N3) + day;
+  
+  // Convert to fractional day (UTC+1 for Oslo)
+  double fractionalDay = dayOfYear + (hour - 1) / 24.0 + minute / 1440.0;
+  
+  // Mean solar time
+  double J2000 = 2451545.0;
+  double JD = fractionalDay + 2451544.5;
+  double n = JD - J2000;
+  
+  // Solar mean longitude
+  double L = fmod(280.46646 + 0.9856474 * n, 360.0);
+  if (L < 0) L += 360.0;
+  
+  // Mean anomaly
+  double g = fmod(357.52911 + 0.9856473 * n, 360.0);
+  if (g < 0) g += 360.0;
+  
+  // Convert to radians
+  double L_rad = L * M_PI / 180.0;
+  double g_rad = g * M_PI / 180.0;
+  
+  // Solar equation of center
+  double C = (1.914602 - 0.004817 * n / 36525 - 0.000014 * n / 36525 * n / 36525) * sin(g_rad);
+  C += (0.019993 - 0.000101 * n / 36525) * sin(2 * g_rad);
+  C += 0.000029 * sin(3 * g_rad);
+  
+  // Solar true longitude
+  double sunLong = L + C;
+  
+  // Solar apparent longitude
+  double Omega = fmod(125.04 - 1.9 * n / 36525, 360.0);
+  double lambda = sunLong - 0.00569 - 0.00478 * sin(Omega * M_PI / 180.0);
+  
+  // Solar declination
+  double epsilon = 23.439291 - 0.0130042 * n / 36525 - 0.00000164 * n / 36525 * n / 36525;
+  double lambda_rad = lambda * M_PI / 180.0;
+  double epsilon_rad = epsilon * M_PI / 180.0;
+  double delta = asin(sin(epsilon_rad) * sin(lambda_rad)) * 180.0 / M_PI;
+  
+  // Observer's latitude and longitude (Oslo)
+  double lat = 59.9139;
+  double lon = 10.7522;
+  double lat_rad = lat * M_PI / 180.0;
+  double delta_rad = delta * M_PI / 180.0;
+  
+  // Hour angle
+  double H0_rad = acos(-tan(lat_rad) * tan(delta_rad));
+  if (isnan(H0_rad)) {
+    // Sun always above or below horizon
+    return sin(lat_rad) * sin(delta_rad) < 0; // true if always below
+  }
+  
+  double H0 = H0_rad * 180.0 / M_PI;
+  
+  // Equation of time
+  double eot = 229.18 * (0.016708617 - n / 36525 * (0.042037 + 0.0001267 * n / 36525)) * sin(g_rad);
+  eot -= 2.4 * cos(2 * g_rad) + 4.0 * sin(2 * g_rad);
+  
+  // Apparent solar time
+  double ast = (hour * 60 + minute + eot) / 60.0;
+  
+  // Sunrise and sunset (in local time, UTC+1)
+  double sunrise = 12 - H0 / 15 - lon / 15 - 1; // -1 for UTC offset
+  double sunset = 12 + H0 / 15 - lon / 15 - 1;
+  
+  double currentTime = hour + minute / 60.0;
+  
+  bool dark = (currentTime < sunrise) || (currentTime > sunset);
+  return dark;
 }
 
 void publishState(const String &topic, bool state) {
@@ -440,6 +538,18 @@ void setup() {
     wifiManager.autoConnect("Heater-Setup-AP", DEFAULT_WIFI_PASS);
   }
 
+  // Synchronize time with NTP server (needed for sun calculations)
+  configTime(1 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // UTC+1 for Oslo (winter), will handle DST via system
+  Serial.println("Waiting for NTP time sync...");
+  time_t now = time(nullptr);
+  int attempts = 0;
+  while (now < 24 * 3600 && attempts < 30) {
+    delay(500);
+    now = time(nullptr);
+    attempts++;
+  }
+  Serial.printf("Time synced: %s\n", ctime(&now));
+
   // On success, copy back settings from persistent parameters (calibration only)
   if (p_custom_vdiv) cfg.voltage_divider = atof(p_custom_vdiv->getValue());
   if (p_custom_lowv) cfg.low_voltage_threshold = atof(p_custom_lowv->getValue());
@@ -511,6 +621,23 @@ void loop() {
     // turn ACC off
     relay4_state = false; setRelay(RELAY4_PIN, false); publishState(topic_relay4_state, false);
     publishState(topic_precondition_state, false);
+  }
+
+  // Sun-based automation for LIGHT relay (check every minute)
+  if (sun_automation_enabled && millis() - last_sun_check > SUN_CHECK_INTERVAL) {
+    last_sun_check = millis();
+    bool was_dark = is_dark_now;
+    is_dark_now = isSunDown();
+    
+    // Change relay state if darkness changed
+    if (is_dark_now != was_dark) {
+      relay1_state = is_dark_now; // Turn ON when dark, OFF when light
+      setRelay(RELAY1_PIN, relay1_state);
+      publishState(topic_relay1_state, relay1_state);
+      Serial.printf("Sun automation: Light is now %s (sun is %s)\n", 
+                    relay1_state ? "ON" : "OFF", 
+                    is_dark_now ? "down" : "up");
+    }
   }
 
   // Battery measurement at configurable interval; publish only on significant change
