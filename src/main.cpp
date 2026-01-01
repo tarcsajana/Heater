@@ -10,7 +10,7 @@
 
 // Pin mapping (Wemos D1 mini labels)
 const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
-const uint8_t RELAY4_PIN = D5; // ACC (inverted)
+const uint8_t RELAY4_PIN = D1; // ACC (inverted) - Changed from D5
 const uint8_t RELAY2_PIN = D7; // READY (inverted)
 const uint8_t RELAY3_PIN = D6; // HORN (inverted)
 
