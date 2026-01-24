@@ -498,6 +498,15 @@ void setup() {
 
   loadConfig();
 
+  // Configure static IP: 192.168.1.101
+  IPAddress staticIP(192, 168, 1, 101);
+  IPAddress gateway(192, 168, 1, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns1(192, 168, 1, 1);     // Router as DNS
+  IPAddress dns2(8, 8, 8, 8);         // Google DNS fallback
+  
+  WiFi.config(staticIP, gateway, subnet, dns1, dns2);
+
   wifiManager.setSaveConfigCallback([](){
     // This will be called when WiFiManager saves new WiFi credentials
   });
