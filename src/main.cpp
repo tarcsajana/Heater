@@ -13,8 +13,8 @@
 // Firmware version
 const char* FIRMWARE_VERSION = "1.0.0";
 const char* FIRMWARE_BUILD_TIME = __DATE__ " " __TIME__;
-const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/latest/download/firmware.bin";
-const char* GITHUB_TOKEN = "";  // Empty for public repo, set to PAT for private repo
+const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/download/OTA/firmware.bin";
+const char* GITHUB_TOKEN = "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";  // Empty for public repo, set to PAT for private repo
 
 // Pin mapping (Wemos D1 mini labels)
 const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
