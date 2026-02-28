@@ -5,8 +5,16 @@
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <Updater.h>
 #include <time.h>
 #include <cmath>
+
+// Firmware version
+const char* FIRMWARE_VERSION = "1.0.0";
+const char* FIRMWARE_BUILD_TIME = __DATE__ " " __TIME__;
+const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/latest/download/firmware.bin";
+const char* GITHUB_TOKEN = "";  // Empty for public repo, set to PAT for private repo
 
 // Pin mapping (Wemos D1 mini labels)
 const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
@@ -89,9 +97,88 @@ String topic_precondition_cmd, topic_precondition_state;
 String topic_battery_state;
 String topic_auto_low_cmd, topic_auto_low_state;
 
+// OTA topics
+String topic_firmware_cmd;
+String topic_firmware_state;
+String topic_power_cmd;
+String topic_down_cmd;
+String topic_up_cmd;
+String topic_mode_cmd;
+String topic_status;
+
 // helper to write inverted relay pins (LOW = ON)
 void setRelay(uint8_t pin, bool on) {
   digitalWrite(pin, on ? LOW : HIGH);
+}
+
+// Publish firmware info to MQTT
+void publishFirmwareInfo() {
+  if (!mqttClient.connected()) return;
+  StaticJsonDocument<256> doc;
+  doc["fw_version"] = FIRMWARE_VERSION;
+  doc["build_time"] = FIRMWARE_BUILD_TIME;
+  char buf[256];
+  serializeJson(doc, buf);
+  mqttClient.publish(topic_firmware_state.c_str(), buf, true);
+}
+
+// HTTP firmware update from URL
+void performSelfUpdate(String url) {
+  Serial.printf("Starting firmware update from: %s\n", url.c_str());
+  
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(10000);
+  
+  if (!http.begin(client, url)) {
+    Serial.println("HTTP begin failed");
+    return;
+  }
+  
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("HTTP error: %d\n", httpCode);
+    http.end();
+    return;
+  }
+  
+  int len = http.getSize();
+  if (len <= 0) {
+    Serial.println("Content-Length invalid");
+    http.end();
+    return;
+  }
+  
+  Serial.printf("Firmware size: %d bytes\n", len);
+  
+  if (!Update.begin(len)) {
+    Serial.println("Update.begin() failed");
+    http.end();
+    return;
+  }
+  
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+  http.end();
+  
+  if (written != len) {
+    Serial.printf("Written %zu bytes, expected %d\n", written, len);
+    Update.end();
+    return;
+  }
+  
+  if (!Update.end()) {
+    Serial.println("Update.end() failed");
+    return;
+  }
+  
+  if (Update.isFinished()) {
+    Serial.println("Self-update OK - rebooting");
+    delay(1000);
+    ESP.restart();
+  } else {
+    Serial.println("Update not finished");
+  }
 }
 
 // Check if sun is down (before sunrise or after sunset)
@@ -239,6 +326,14 @@ void setupTopics() {
   topic_auto_low_cmd = topic_base + "/auto_low/set";
   topic_auto_low_state = topic_base + "/auto_low/state";
 
+  topic_firmware_cmd = topic_base + "/firmware/set";
+  topic_firmware_state = topic_base + "/firmware";
+  topic_power_cmd = topic_base + "/power";
+  topic_down_cmd = topic_base + "/down";
+  topic_up_cmd = topic_base + "/up";
+  topic_mode_cmd = topic_base + "/mode";
+  topic_status = topic_base + "/status";
+
   mqttClient.subscribe(topic_relay1_cmd.c_str());
   mqttClient.subscribe(topic_relay2_cmd.c_str());
   mqttClient.subscribe(topic_relay3_cmd.c_str());
@@ -246,6 +341,11 @@ void setupTopics() {
   mqttClient.subscribe(topic_precondition_cmd.c_str());
   mqttClient.subscribe(topic_auto_low_cmd.c_str());
   mqttClient.subscribe((topic_base + "/settings/set").c_str());
+  mqttClient.subscribe(topic_firmware_cmd.c_str());
+  mqttClient.subscribe(topic_power_cmd.c_str());
+  mqttClient.subscribe(topic_down_cmd.c_str());
+  mqttClient.subscribe(topic_up_cmd.c_str());
+  mqttClient.subscribe(topic_mode_cmd.c_str());
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -253,6 +353,24 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   String msg;
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   msg.trim();
+
+  // Handle OTA firmware update command
+  if (t == topic_firmware_cmd) {
+    // Extract URL from message (format: "self_update <url>" or just URL)
+    String url = msg;
+    if (msg.startsWith("self_update ")) {
+      url = msg.substring(12); // skip "self_update "
+    }
+    if (url.length() > 10 && (url.startsWith("http://") || url.startsWith("https://"))) {
+      Serial.printf("OTA command received with URL: %s\n", url.c_str());
+      performSelfUpdate(url);
+    } else if (msg.equalsIgnoreCase("self_update")) {
+      // Use default configured URL
+      Serial.printf("OTA command received, using default URL: %s\n", FIRMWARE_URL);
+      performSelfUpdate(String(FIRMWARE_URL));
+    }
+    return;
+  }
 
   auto handleToggle = [&](String const &t_on, bool &state, uint8_t pin, const String &stateTopic){
     if (t == t_on) {
@@ -383,6 +501,8 @@ void mqttReconnect() {
     // publish online status retained
     String status_topic = topic_base + "/status";
     mqttClient.publish(status_topic.c_str(), "online", true);
+    // Publish firmware info
+    publishFirmwareInfo();
     // Publish HA discovery only once per boot (avoid repeated discovery on reconnects)
     if (!ha_discovery_published) {
       publishHADiscovery();
@@ -431,6 +551,17 @@ void publishHADiscovery() {
   doc2["device_class"] = "voltage";
   char buf2[256]; serializeJson(doc2, buf2);
   mqttClient.publish(disc_batt.c_str(), buf2, false);
+
+  // firmware sensor
+  String disc_fw = String("homeassistant/sensor/") + node + "/firmware/config";
+  StaticJsonDocument<256> doc3;
+  doc3["name"] = "Heater Firmware";
+  doc3["uniq_id"] = node + String("_firmware");
+  doc3["stat_t"] = topic_firmware_state;
+  doc3["val_tpl"] = "{{ value_json.fw_version ~ ' (' ~ value_json.build_time ~ ')' }}";
+  doc3["icon"] = "mdi:chip";
+  char buf3[256]; serializeJson(doc3, buf3);
+  mqttClient.publish(disc_fw.c_str(), buf3, false);
 }
 
 // Web server handler for settings portal trigger
