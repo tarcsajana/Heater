@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
 #include <Updater.h>
 #include <time.h>
 #include <cmath>
@@ -105,6 +106,7 @@ String topic_down_cmd;
 String topic_up_cmd;
 String topic_mode_cmd;
 String topic_status;
+const char* LEGACY_FIRMWARE_CMD = "heater/firmware/set";
 
 // helper to write inverted relay pins (LOW = ON)
 void setRelay(uint8_t pin, bool on) {
@@ -125,53 +127,66 @@ void publishFirmwareInfo() {
 // HTTP firmware update from URL
 void performSelfUpdate(String url) {
   Serial.printf("Starting firmware update from: %s\n", url.c_str());
-  
-  WiFiClient client;
+
   HTTPClient http;
-  http.setTimeout(10000);
-  
-  if (!http.begin(client, url)) {
-    Serial.println("HTTP begin failed");
-    return;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  bool isHttps = url.startsWith("https://");
+  std::unique_ptr<BearSSL::WiFiClientSecure> secureClient;
+  std::unique_ptr<WiFiClient> plainClient;
+
+  if (isHttps) {
+    secureClient.reset(new BearSSL::WiFiClientSecure());
+    secureClient->setInsecure(); // allow GitHub TLS without pinned cert
+    if (!http.begin(*secureClient, url)) {
+      Serial.println("HTTPS begin failed");
+      return;
+    }
+  } else {
+    plainClient.reset(new WiFiClient());
+    if (!http.begin(*plainClient, url)) {
+      Serial.println("HTTP begin failed");
+      return;
+    }
   }
-  
+
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
     Serial.printf("HTTP error: %d\n", httpCode);
     http.end();
     return;
   }
-  
+
   int len = http.getSize();
-  if (len <= 0) {
-    Serial.println("Content-Length invalid");
-    http.end();
-    return;
+  if (len > 0) {
+    Serial.printf("Firmware size: %d bytes\n", len);
+  } else {
+    Serial.println("Content-Length unknown, using max sketch space");
   }
-  
-  Serial.printf("Firmware size: %d bytes\n", len);
-  
-  if (!Update.begin(len)) {
+
+  size_t updateSize = (len > 0) ? (size_t)len : ((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000);
+  if (!Update.begin(updateSize)) {
     Serial.println("Update.begin() failed");
     http.end();
     return;
   }
-  
+
   WiFiClient* stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   http.end();
-  
-  if (written != len) {
+
+  if (len > 0 && written != (size_t)len) {
     Serial.printf("Written %zu bytes, expected %d\n", written, len);
     Update.end();
     return;
   }
-  
+
   if (!Update.end()) {
     Serial.println("Update.end() failed");
     return;
   }
-  
+
   if (Update.isFinished()) {
     Serial.println("Self-update OK - rebooting");
     delay(1000);
@@ -342,6 +357,7 @@ void setupTopics() {
   mqttClient.subscribe(topic_auto_low_cmd.c_str());
   mqttClient.subscribe((topic_base + "/settings/set").c_str());
   mqttClient.subscribe(topic_firmware_cmd.c_str());
+  mqttClient.subscribe(LEGACY_FIRMWARE_CMD);
   mqttClient.subscribe(topic_power_cmd.c_str());
   mqttClient.subscribe(topic_down_cmd.c_str());
   mqttClient.subscribe(topic_up_cmd.c_str());
@@ -355,7 +371,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   msg.trim();
 
   // Handle OTA firmware update command
-  if (t == topic_firmware_cmd) {
+  if (t == topic_firmware_cmd || t == String(LEGACY_FIRMWARE_CMD)) {
     // Extract URL from message (format: "self_update <url>" or just URL)
     String url = msg;
     if (msg.startsWith("self_update ")) {
@@ -562,6 +578,17 @@ void publishHADiscovery() {
   doc3["icon"] = "mdi:chip";
   char buf3[256]; serializeJson(doc3, buf3);
   mqttClient.publish(disc_fw.c_str(), buf3, true);
+
+  // self update button
+  String disc_btn = String("homeassistant/button/") + node + "/self_update/config";
+  StaticJsonDocument<384> doc4;
+  doc4["name"] = "Heater Self Update";
+  doc4["uniq_id"] = node + String("_self_update");
+  doc4["cmd_t"] = topic_firmware_cmd;
+  doc4["pl_prs"] = String("self_update ") + FIRMWARE_URL;
+  doc4["icon"] = "mdi:update";
+  char buf4[384]; serializeJson(doc4, buf4);
+  mqttClient.publish(disc_btn.c_str(), buf4, true);
 }
 
 // Web server handler for settings portal trigger
