@@ -139,19 +139,24 @@ void performSelfUpdate(String url) {
   if (isHttps) {
     secureClient.reset(new BearSSL::WiFiClientSecure());
     secureClient->setInsecure(); // allow GitHub TLS without pinned cert
+    Serial.println("[OTA DEBUG] Using HTTPS client");
     if (!http.begin(*secureClient, url)) {
       Serial.println("HTTPS begin failed");
       return;
     }
   } else {
     plainClient.reset(new WiFiClient());
+    Serial.println("[OTA DEBUG] Using HTTP client");
     if (!http.begin(*plainClient, url)) {
       Serial.println("HTTP begin failed");
       return;
     }
   }
 
+  Serial.println("[OTA DEBUG] HTTP client initialized, sending GET request");
   int httpCode = http.GET();
+  Serial.printf("[OTA DEBUG] HTTP response code: %d\n", httpCode);
+  
   if (httpCode != HTTP_CODE_OK) {
     Serial.printf("HTTP error: %d\n", httpCode);
     http.end();
@@ -159,6 +164,7 @@ void performSelfUpdate(String url) {
   }
 
   int len = http.getSize();
+  Serial.printf("[OTA DEBUG] Content-Length: %d bytes\n", len);
   if (len > 0) {
     Serial.printf("Firmware size: %d bytes\n", len);
   } else {
@@ -166,16 +172,20 @@ void performSelfUpdate(String url) {
   }
 
   size_t updateSize = (len > 0) ? (size_t)len : ((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000);
+  Serial.printf("[OTA DEBUG] Update size to allocate: %u bytes\n", updateSize);
+  
   if (!Update.begin(updateSize)) {
     Serial.println("Update.begin() failed");
     http.end();
     return;
   }
 
+  Serial.println("[OTA DEBUG] Update.begin() succeeded, starting write stream");
   WiFiClient* stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   http.end();
 
+  Serial.printf("[OTA DEBUG] Written %u bytes to Update\n", written);
   if (len > 0 && written != (size_t)len) {
     Serial.printf("Written %zu bytes, expected %d\n", written, len);
     Update.end();
@@ -370,8 +380,15 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   msg.trim();
 
+  Serial.printf("[OTA DEBUG] Message received on topic: %s (len=%u)\n", topic, length);
+  Serial.printf("[OTA DEBUG] topic_firmware_cmd=%s, LEGACY_FIRMWARE_CMD=%s\n", topic_firmware_cmd.c_str(), LEGACY_FIRMWARE_CMD);
+  Serial.printf("[OTA DEBUG] Topic match: firmware_cmd=%d, legacy=%d\n", 
+                (t == topic_firmware_cmd) ? 1 : 0, 
+                (t == String(LEGACY_FIRMWARE_CMD)) ? 1 : 0);
+
   // Handle OTA firmware update command
   if (t == topic_firmware_cmd || t == String(LEGACY_FIRMWARE_CMD)) {
+    Serial.printf("[OTA DEBUG] OTA topic matched! Message: %s\n", msg.c_str());
     // Extract URL from message (format: "self_update <url>" or just URL)
     String url = msg;
     if (msg.startsWith("self_update ")) {
