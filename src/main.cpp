@@ -531,7 +531,7 @@ void publishHADiscovery() {
     doc["pl_off"] = "OFF";
     char buf[512];
     serializeJson(doc, buf);
-    mqttClient.publish(disc.c_str(), buf, false);
+    mqttClient.publish(disc.c_str(), buf, true);
   };
 
   publishSwitch("acc", "ACC", topic_relay4_cmd, topic_relay4_state);
@@ -550,7 +550,7 @@ void publishHADiscovery() {
   doc2["unit_of_meas"] = "V";
   doc2["device_class"] = "voltage";
   char buf2[256]; serializeJson(doc2, buf2);
-  mqttClient.publish(disc_batt.c_str(), buf2, false);
+  mqttClient.publish(disc_batt.c_str(), buf2, true);
 
   // firmware sensor
   String disc_fw = String("homeassistant/sensor/") + node + "/firmware/config";
@@ -561,7 +561,7 @@ void publishHADiscovery() {
   doc3["val_tpl"] = "{{ value_json.fw_version ~ ' (' ~ value_json.build_time ~ ')' }}";
   doc3["icon"] = "mdi:chip";
   char buf3[256]; serializeJson(doc3, buf3);
-  mqttClient.publish(disc_fw.c_str(), buf3, false);
+  mqttClient.publish(disc_fw.c_str(), buf3, true);
 }
 
 // Web server handler for settings portal trigger
