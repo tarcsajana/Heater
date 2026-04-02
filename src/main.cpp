@@ -12,7 +12,7 @@
 #include <cmath>
 
 // Firmware version
-const char* FIRMWARE_VERSION = "1.0.0";
+const char* FIRMWARE_VERSION = "1.1";
 const char* FIRMWARE_BUILD_TIME = __DATE__ " " __TIME__;
 const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/latest/download/firmware.bin";
 const char* GITHUB_TOKEN = "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";  // Empty for public repo, set to PAT for private repo
@@ -21,7 +21,7 @@ const char* GITHUB_TOKEN = "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";  // Empty
 const uint8_t RELAY1_PIN = D8; // LIGHT (inverted)
 const uint8_t RELAY4_PIN = D5; // ACC (inverted) - Changed from D5
 const uint8_t RELAY2_PIN = D7; // READY (inverted)
-const uint8_t RELAY3_PIN = D6; // HORN (inverted)
+const uint8_t RELAY3_PIN = D6; // ILLUMINATION / radio brightness wire (inverted)
 
 // ADC pin
 #define ADC_PIN A0
@@ -75,7 +75,7 @@ WiFiManagerParameter *p_custom_batdelt = nullptr;
 // runtime state
 bool relay1_state = false; // LIGHT
 bool relay2_state = false; // READY
-bool relay3_state = false; // HORN
+bool relay3_state = false; // ILLUMINATION (radio brightness wire)
 bool relay4_state = false; // ACC
 bool precondition_state = false;
 bool portal_requested = false; // flag to request settings portal
@@ -84,9 +84,6 @@ bool portal_requested = false; // flag to request settings portal
 unsigned long precond_on_until = 0; // millis until which precondition auto-on stays
 unsigned long seq_step_until = 0;
 int seq_step = 0;
-
-// Relay3 (HORN) auto-off timer
-unsigned long relay3_off_at = 0;
 
 // MQTT topics (built at setup)
 String topic_base;
@@ -241,7 +238,6 @@ bool isSunDown() {
   if (g < 0) g += 360.0;
   
   // Convert to radians
-  double L_rad = L * M_PI / 180.0;
   double g_rad = g * M_PI / 180.0;
   
   // Solar equation of center
@@ -280,9 +276,6 @@ bool isSunDown() {
   // Equation of time
   double eot = 229.18 * (0.016708617 - n / 36525 * (0.042037 + 0.0001267 * n / 36525)) * sin(g_rad);
   eot -= 2.4 * cos(2 * g_rad) + 4.0 * sin(2 * g_rad);
-  
-  // Apparent solar time
-  double ast = (hour * 60 + minute + eot) / 60.0;
   
   // Sunrise and sunset (in local time, UTC+1)
   double sunrise = 12 - H0 / 15 - lon / 15 - 1; // -1 for UTC offset
@@ -417,16 +410,12 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   handleToggle(topic_relay1_cmd, relay1_state, RELAY1_PIN, topic_relay1_state);
   handleToggle(topic_relay2_cmd, relay2_state, RELAY2_PIN, topic_relay2_state);
   
-  // Relay3 (HORN) with auto-off after 0.5s
+  // Relay3 (ILLUMINATION) - manual brightness override via MQTT
   if (t == topic_relay3_cmd) {
     bool newState = (msg.equalsIgnoreCase("on") || msg == "1" || msg.equalsIgnoreCase("true"));
     relay3_state = newState;
     setRelay(RELAY3_PIN, relay3_state);
     publishState(topic_relay3_state, relay3_state);
-    if (relay3_state) {
-      // Schedule auto-off after 500ms
-      relay3_off_at = millis() + 500UL;
-    }
   }
   
   handleToggle(topic_relay4_cmd, relay4_state, RELAY4_PIN, topic_relay4_state);
@@ -569,7 +558,7 @@ void publishHADiscovery() {
 
   publishSwitch("acc", "ACC", topic_relay4_cmd, topic_relay4_state);
   publishSwitch("ready", "READY", topic_relay2_cmd, topic_relay2_state);
-  publishSwitch("horn", "HORN", topic_relay3_cmd, topic_relay3_state);
+  publishSwitch("illumination", "Illumination", topic_relay3_cmd, topic_relay3_state);
   publishSwitch("light", "LIGHT", topic_relay1_cmd, topic_relay1_state);
   publishSwitch("precondition", "PRECONDITION", topic_precondition_cmd, topic_precondition_state);
   publishSwitch("auto_low", "Auto PRECOND Low", topic_auto_low_cmd, topic_auto_low_state);
@@ -777,14 +766,6 @@ void loop() {
   }
   mqttClient.loop();
 
-  // Relay3 (HORN) auto-off after 0.5s
-  if (relay3_off_at != 0 && millis() >= relay3_off_at) {
-    relay3_state = false;
-    setRelay(RELAY3_PIN, false);
-    publishState(topic_relay3_state, false);
-    relay3_off_at = 0;
-  }
-
   // handle precondition sequence state machine
   if (seq_step == 1 && millis() >= seq_step_until) {
     // turn READY on
@@ -815,11 +796,17 @@ void loop() {
     
     // Change relay state if darkness changed
     if (is_dark_now != was_dark) {
+      // LIGHT relay
       relay1_state = is_dark_now; // Turn ON when dark, OFF when light
       setRelay(RELAY1_PIN, relay1_state);
       publishState(topic_relay1_state, relay1_state);
-      Serial.printf("Sun automation: Light is now %s (sun is %s)\n", 
-                    relay1_state ? "ON" : "OFF", 
+      // ILLUMINATION relay: dim display when dark (illumination wire ON = dim mode)
+      relay3_state = is_dark_now;
+      setRelay(RELAY3_PIN, relay3_state);
+      publishState(topic_relay3_state, relay3_state);
+      Serial.printf("Sun automation: Light=%s, Illumination=%s (sun is %s)\n",
+                    relay1_state ? "ON" : "OFF",
+                    relay3_state ? "DIM" : "BRIGHT",
                     is_dark_now ? "down" : "up");
     }
   }
