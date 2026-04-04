@@ -537,13 +537,15 @@ void mqttReconnect() {
 void publishHADiscovery() {
   if (!mqttClient.connected()) return;
   String node = WiFi.macAddress(); node.replace(":", "");
+  String ha_device_id = String("heater_") + node;
+  String ha_device_name = String("Heater Controller ") + node;
   // Relay mappings per user request:
   // relay4 = ACC, relay2 = READY, relay3 = HORN, relay1 = LIGHT
 
   // helper
   auto publishSwitch = [&](const String &obj_id, const String &name, const String &cmd_topic, const String &state_topic){
     String disc = String("homeassistant/switch/") + node + "/" + obj_id + "/config";
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<768> doc;
     doc["name"] = name;
     doc["uniq_id"] = node + "_" + obj_id;
     doc["cmd_t"] = cmd_topic;
@@ -551,7 +553,13 @@ void publishHADiscovery() {
     doc["qos"] = 0;
     doc["pl_on"] = "ON";
     doc["pl_off"] = "OFF";
-    char buf[512];
+    JsonObject device = doc["device"].to<JsonObject>();
+    device["identifiers"][0] = ha_device_id;
+    device["name"] = ha_device_name;
+    device["manufacturer"] = "Custom";
+    device["model"] = "Heater Controller";
+    device["sw_version"] = FIRMWARE_VERSION;
+    char buf[768];
     serializeJson(doc, buf);
     mqttClient.publish(disc.c_str(), buf, true);
   };
@@ -565,35 +573,53 @@ void publishHADiscovery() {
 
   // battery sensor
   String disc_batt = String("homeassistant/sensor/") + node + "/battery/config";
-  StaticJsonDocument<256> doc2;
+  StaticJsonDocument<512> doc2;
   doc2["name"] = "Heater Battery";
   doc2["uniq_id"] = node + String("_battery");
   doc2["stat_t"] = topic_battery_state;
   doc2["unit_of_meas"] = "V";
   doc2["device_class"] = "voltage";
-  char buf2[256]; serializeJson(doc2, buf2);
+  JsonObject device2 = doc2["device"].to<JsonObject>();
+  device2["identifiers"][0] = ha_device_id;
+  device2["name"] = ha_device_name;
+  device2["manufacturer"] = "Custom";
+  device2["model"] = "Heater Controller";
+  device2["sw_version"] = FIRMWARE_VERSION;
+  char buf2[512]; serializeJson(doc2, buf2);
   mqttClient.publish(disc_batt.c_str(), buf2, true);
 
   // firmware sensor
   String disc_fw = String("homeassistant/sensor/") + node + "/firmware/config";
-  StaticJsonDocument<256> doc3;
+  StaticJsonDocument<512> doc3;
   doc3["name"] = "Heater Firmware";
   doc3["uniq_id"] = node + String("_firmware");
   doc3["stat_t"] = topic_firmware_state;
   doc3["val_tpl"] = "{{ value_json.fw_version ~ ' (' ~ value_json.build_time ~ ')' }}";
   doc3["icon"] = "mdi:chip";
-  char buf3[256]; serializeJson(doc3, buf3);
+  JsonObject device3 = doc3["device"].to<JsonObject>();
+  device3["identifiers"][0] = ha_device_id;
+  device3["name"] = ha_device_name;
+  device3["manufacturer"] = "Custom";
+  device3["model"] = "Heater Controller";
+  device3["sw_version"] = FIRMWARE_VERSION;
+  char buf3[512]; serializeJson(doc3, buf3);
   mqttClient.publish(disc_fw.c_str(), buf3, true);
 
   // self update button
   String disc_btn = String("homeassistant/button/") + node + "/self_update/config";
-  StaticJsonDocument<384> doc4;
+  StaticJsonDocument<640> doc4;
   doc4["name"] = "Heater Self Update";
   doc4["uniq_id"] = node + String("_self_update");
   doc4["cmd_t"] = topic_firmware_cmd;
   doc4["pl_prs"] = String("self_update ") + FIRMWARE_URL;
   doc4["icon"] = "mdi:update";
-  char buf4[384]; serializeJson(doc4, buf4);
+  JsonObject device4 = doc4["device"].to<JsonObject>();
+  device4["identifiers"][0] = ha_device_id;
+  device4["name"] = ha_device_name;
+  device4["manufacturer"] = "Custom";
+  device4["model"] = "Heater Controller";
+  device4["sw_version"] = FIRMWARE_VERSION;
+  char buf4[640]; serializeJson(doc4, buf4);
   mqttClient.publish(disc_btn.c_str(), buf4, true);
 }
 
