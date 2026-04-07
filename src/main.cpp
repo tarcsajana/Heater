@@ -206,6 +206,13 @@ String resolveGitHubLatestAssetUrl(const String& inputUrl) {
 void performSelfUpdate(String url) {
   String originalUrl = url;
   url = resolveGitHubLatestAssetUrl(url);
+  
+  // For private repos, append GitHub token as query parameter for release downloads
+  if (strlen(GITHUB_TOKEN) > 0 && url.indexOf("github.com") > 0 && url.indexOf("?") < 0) {
+    Serial.println("[OTA DEBUG] Appending GitHub token for private repo access");
+    url += "?token=" + String(GITHUB_TOKEN);
+  }
+  
   Serial.printf("[OTA DEBUG] Original URL: %s\n", originalUrl.c_str());
   Serial.printf("[OTA DEBUG] Resolved URL: %s\n", url.c_str());
   Serial.printf("Starting firmware update from: %s\n", url.c_str());
@@ -262,11 +269,9 @@ void performSelfUpdate(String url) {
   }
 
   // HTTP_UPDATE_FAILED or other error
-  Serial.printf("[OTA DEBUG] HTTP error code: %d\n", ESPhttpUpdate.getLastHTTPCode());
-  Serial.printf("[OTA DEBUG] Last error: %d (%s)\n",
-                ESPhttpUpdate.getLastError(),
-                ESPhttpUpdate.getLastErrorString().c_str());
-  Serial.printf("[OTA DEBUG] Error details available at update end\n");
+  int lastErr = ESPhttpUpdate.getLastError();
+  Serial.printf("[OTA DEBUG] Last error: %d\n", lastErr);
+  Serial.printf("[OTA DEBUG] Error string: %s\n", ESPhttpUpdate.getLastErrorString().c_str());
 }
 
 // Check if sun is down (before sunrise or after sunset)
