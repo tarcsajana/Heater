@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <Updater.h>
 #include <time.h>
@@ -79,6 +80,8 @@ bool relay3_state = false; // ILLUMINATION (radio brightness wire)
 bool relay4_state = false; // ACC
 bool precondition_state = false;
 bool portal_requested = false; // flag to request settings portal
+bool ota_update_pending = false;
+String ota_update_url;
 
 // Precondition timers and state machine
 unsigned long precond_on_until = 0; // millis until which precondition auto-on stays
@@ -121,86 +124,140 @@ void publishFirmwareInfo() {
   mqttClient.publish(topic_firmware_state.c_str(), buf, true);
 }
 
+bool parseGitHubLatestDownloadUrl(const String& url, String& ownerRepo, String& assetName) {
+  const String prefix = "https://github.com/";
+  const String marker = "/releases/latest/download/";
+  if (!url.startsWith(prefix)) return false;
+
+  int repoStart = prefix.length();
+  int markerPos = url.indexOf(marker, repoStart);
+  if (markerPos < 0) return false;
+
+  ownerRepo = url.substring(repoStart, markerPos);
+  int assetStart = markerPos + marker.length();
+  if (assetStart >= (int)url.length()) return false;
+
+  assetName = url.substring(assetStart);
+  int qPos = assetName.indexOf('?');
+  if (qPos >= 0) assetName = assetName.substring(0, qPos);
+
+  return ownerRepo.indexOf('/') > 0 && assetName.length() > 0;
+}
+
+String resolveGitHubLatestAssetUrl(const String& inputUrl) {
+  String ownerRepo;
+  String assetName;
+  if (!parseGitHubLatestDownloadUrl(inputUrl, ownerRepo, assetName)) {
+    return inputUrl;
+  }
+
+  String apiUrl = "https://api.github.com/repos/" + ownerRepo + "/releases/latest";
+  HTTPClient apiHttp;
+  apiHttp.setTimeout(15000);
+  apiHttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> apiClient(new BearSSL::WiFiClientSecure());
+  apiClient->setInsecure();
+
+  if (!apiHttp.begin(*apiClient, apiUrl)) {
+    Serial.println("[OTA DEBUG] GitHub API begin failed, using original URL");
+    return inputUrl;
+  }
+
+  apiHttp.addHeader("User-Agent", "Heater-ESP8266");
+  if (strlen(GITHUB_TOKEN) > 0) {
+    apiHttp.addHeader("Authorization", String("Bearer ") + GITHUB_TOKEN);
+  }
+
+  int code = apiHttp.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[OTA DEBUG] GitHub API latest release lookup failed: %d\n", code);
+    apiHttp.end();
+    return inputUrl;
+  }
+
+  String body = apiHttp.getString();
+  apiHttp.end();
+
+  StaticJsonDocument<8192> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[OTA DEBUG] GitHub API JSON parse failed: %s\n", err.c_str());
+    return inputUrl;
+  }
+
+  JsonArray assets = doc["assets"].as<JsonArray>();
+  for (JsonObject asset : assets) {
+    const char* name = asset["name"];
+    if (name && assetName == String(name)) {
+      const char* dl = asset["browser_download_url"];
+      if (dl && strlen(dl) > 0) {
+        Serial.printf("[OTA DEBUG] Resolved latest asset URL for %s\n", assetName.c_str());
+        return String(dl);
+      }
+    }
+  }
+
+  Serial.printf("[OTA DEBUG] Asset '%s' not found in latest release\n", assetName.c_str());
+  return inputUrl;
+}
+
 // HTTP firmware update from URL
 void performSelfUpdate(String url) {
+  url = resolveGitHubLatestAssetUrl(url);
   Serial.printf("Starting firmware update from: %s\n", url.c_str());
 
-  HTTPClient http;
-  http.setTimeout(15000);
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  ESPhttpUpdate.rebootOnUpdate(false);
+  ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  ESPhttpUpdate.onStart([]() {
+    Serial.println("[OTA DEBUG] OTA update started");
+  });
+  ESPhttpUpdate.onProgress([](int cur, int total) {
+    static unsigned long lastLog = 0;
+    unsigned long now = millis();
+    if (now - lastLog >= 1000UL) {
+      Serial.printf("[OTA DEBUG] OTA progress: %d/%d bytes\n", cur, total);
+      lastLog = now;
+    }
+    yield();
+  });
+  ESPhttpUpdate.onEnd([]() {
+    Serial.println("[OTA DEBUG] OTA download finished");
+  });
+  ESPhttpUpdate.onError([](int err) {
+    Serial.printf("[OTA DEBUG] OTA error callback: %d\n", err);
+  });
 
-  bool isHttps = url.startsWith("https://");
-  std::unique_ptr<BearSSL::WiFiClientSecure> secureClient;
-  std::unique_ptr<WiFiClient> plainClient;
+  Serial.printf("[OTA DEBUG] Free heap before update: %u\n", ESP.getFreeHeap());
+  yield();
 
-  if (isHttps) {
-    secureClient.reset(new BearSSL::WiFiClientSecure());
-    secureClient->setInsecure(); // allow GitHub TLS without pinned cert
+  t_httpUpdate_return ret;
+  if (url.startsWith("https://")) {
+    BearSSL::WiFiClientSecure secureClient;
+    secureClient.setInsecure();
     Serial.println("[OTA DEBUG] Using HTTPS client");
-    if (!http.begin(*secureClient, url)) {
-      Serial.println("HTTPS begin failed");
-      return;
-    }
+    ret = ESPhttpUpdate.update(secureClient, url);
   } else {
-    plainClient.reset(new WiFiClient());
+    WiFiClient plainClient;
     Serial.println("[OTA DEBUG] Using HTTP client");
-    if (!http.begin(*plainClient, url)) {
-      Serial.println("HTTP begin failed");
-      return;
-    }
+    ret = ESPhttpUpdate.update(plainClient, url);
   }
 
-  Serial.println("[OTA DEBUG] HTTP client initialized, sending GET request");
-  int httpCode = http.GET();
-  Serial.printf("[OTA DEBUG] HTTP response code: %d\n", httpCode);
-  
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("HTTP error: %d\n", httpCode);
-    http.end();
-    return;
-  }
-
-  int len = http.getSize();
-  Serial.printf("[OTA DEBUG] Content-Length: %d bytes\n", len);
-  if (len > 0) {
-    Serial.printf("Firmware size: %d bytes\n", len);
-  } else {
-    Serial.println("Content-Length unknown, using max sketch space");
-  }
-
-  size_t updateSize = (len > 0) ? (size_t)len : ((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000);
-  Serial.printf("[OTA DEBUG] Update size to allocate: %u bytes\n", updateSize);
-  
-  if (!Update.begin(updateSize)) {
-    Serial.println("Update.begin() failed");
-    http.end();
-    return;
-  }
-
-  Serial.println("[OTA DEBUG] Update.begin() succeeded, starting write stream");
-  WiFiClient* stream = http.getStreamPtr();
-  size_t written = Update.writeStream(*stream);
-  http.end();
-
-  Serial.printf("[OTA DEBUG] Written %u bytes to Update\n", written);
-  if (len > 0 && written != (size_t)len) {
-    Serial.printf("Written %zu bytes, expected %d\n", written, len);
-    Update.end();
-    return;
-  }
-
-  if (!Update.end()) {
-    Serial.println("Update.end() failed");
-    return;
-  }
-
-  if (Update.isFinished()) {
+  if (ret == HTTP_UPDATE_OK) {
     Serial.println("Self-update OK - rebooting");
     delay(1000);
     ESP.restart();
-  } else {
-    Serial.println("Update not finished");
+    return;
   }
+
+  if (ret == HTTP_UPDATE_NO_UPDATES) {
+    Serial.println("No update available");
+    return;
+  }
+
+  Serial.printf("Update failed: (%d) %s\n",
+                ESPhttpUpdate.getLastError(),
+                ESPhttpUpdate.getLastErrorString().c_str());
 }
 
 // Check if sun is down (before sunrise or after sunset)
@@ -389,11 +446,15 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     }
     if (url.length() > 10 && (url.startsWith("http://") || url.startsWith("https://"))) {
       Serial.printf("OTA command received with URL: %s\n", url.c_str());
-      performSelfUpdate(url);
+      ota_update_url = url;
+      ota_update_pending = true;
+      Serial.println("[OTA DEBUG] OTA update queued");
     } else if (msg.equalsIgnoreCase("self_update")) {
       // Use default configured URL
       Serial.printf("OTA command received, using default URL: %s\n", FIRMWARE_URL);
-      performSelfUpdate(String(FIRMWARE_URL));
+      ota_update_url = String(FIRMWARE_URL);
+      ota_update_pending = true;
+      Serial.println("[OTA DEBUG] OTA update queued");
     }
     return;
   }
@@ -539,13 +600,15 @@ void publishHADiscovery() {
   String node = WiFi.macAddress(); node.replace(":", "");
   String ha_device_id = String("heater_") + node;
   String ha_device_name = String("Heater Controller ") + node;
+  StaticJsonDocument<768> doc;
+  char buf[768];
   // Relay mappings per user request:
   // relay4 = ACC, relay2 = READY, relay3 = HORN, relay1 = LIGHT
 
   // helper
   auto publishSwitch = [&](const String &obj_id, const String &name, const String &cmd_topic, const String &state_topic){
     String disc = String("homeassistant/switch/") + node + "/" + obj_id + "/config";
-    StaticJsonDocument<768> doc;
+    doc.clear();
     doc["name"] = name;
     doc["uniq_id"] = node + "_" + obj_id;
     doc["cmd_t"] = cmd_topic;
@@ -559,9 +622,9 @@ void publishHADiscovery() {
     device["manufacturer"] = "Custom";
     device["model"] = "Heater Controller";
     device["sw_version"] = FIRMWARE_VERSION;
-    char buf[768];
     serializeJson(doc, buf);
     mqttClient.publish(disc.c_str(), buf, true);
+    yield();
   };
 
   publishSwitch("acc", "ACC", topic_relay4_cmd, topic_relay4_state);
@@ -573,54 +636,57 @@ void publishHADiscovery() {
 
   // battery sensor
   String disc_batt = String("homeassistant/sensor/") + node + "/battery/config";
-  StaticJsonDocument<512> doc2;
-  doc2["name"] = "Heater Battery";
-  doc2["uniq_id"] = node + String("_battery");
-  doc2["stat_t"] = topic_battery_state;
-  doc2["unit_of_meas"] = "V";
-  doc2["device_class"] = "voltage";
-  JsonObject device2 = doc2["device"].to<JsonObject>();
+  doc.clear();
+  doc["name"] = "Heater Battery";
+  doc["uniq_id"] = node + String("_battery");
+  doc["stat_t"] = topic_battery_state;
+  doc["unit_of_meas"] = "V";
+  doc["device_class"] = "voltage";
+  JsonObject device2 = doc["device"].to<JsonObject>();
   device2["identifiers"][0] = ha_device_id;
   device2["name"] = ha_device_name;
   device2["manufacturer"] = "Custom";
   device2["model"] = "Heater Controller";
   device2["sw_version"] = FIRMWARE_VERSION;
-  char buf2[512]; serializeJson(doc2, buf2);
-  mqttClient.publish(disc_batt.c_str(), buf2, true);
+  serializeJson(doc, buf);
+  mqttClient.publish(disc_batt.c_str(), buf, true);
+  yield();
 
   // firmware sensor
   String disc_fw = String("homeassistant/sensor/") + node + "/firmware/config";
-  StaticJsonDocument<512> doc3;
-  doc3["name"] = "Heater Firmware";
-  doc3["uniq_id"] = node + String("_firmware");
-  doc3["stat_t"] = topic_firmware_state;
-  doc3["val_tpl"] = "{{ value_json.fw_version ~ ' (' ~ value_json.build_time ~ ')' }}";
-  doc3["icon"] = "mdi:chip";
-  JsonObject device3 = doc3["device"].to<JsonObject>();
+  doc.clear();
+  doc["name"] = "Heater Firmware";
+  doc["uniq_id"] = node + String("_firmware");
+  doc["stat_t"] = topic_firmware_state;
+  doc["val_tpl"] = "{{ value_json.fw_version ~ ' (' ~ value_json.build_time ~ ')' }}";
+  doc["icon"] = "mdi:chip";
+  JsonObject device3 = doc["device"].to<JsonObject>();
   device3["identifiers"][0] = ha_device_id;
   device3["name"] = ha_device_name;
   device3["manufacturer"] = "Custom";
   device3["model"] = "Heater Controller";
   device3["sw_version"] = FIRMWARE_VERSION;
-  char buf3[512]; serializeJson(doc3, buf3);
-  mqttClient.publish(disc_fw.c_str(), buf3, true);
+  serializeJson(doc, buf);
+  mqttClient.publish(disc_fw.c_str(), buf, true);
+  yield();
 
   // self update button
   String disc_btn = String("homeassistant/button/") + node + "/self_update/config";
-  StaticJsonDocument<640> doc4;
-  doc4["name"] = "Heater Self Update";
-  doc4["uniq_id"] = node + String("_self_update");
-  doc4["cmd_t"] = topic_firmware_cmd;
-  doc4["pl_prs"] = String("self_update ") + FIRMWARE_URL;
-  doc4["icon"] = "mdi:update";
-  JsonObject device4 = doc4["device"].to<JsonObject>();
+  doc.clear();
+  doc["name"] = "Heater Self Update";
+  doc["uniq_id"] = node + String("_self_update");
+  doc["cmd_t"] = topic_firmware_cmd;
+  doc["pl_prs"] = String("self_update ") + FIRMWARE_URL;
+  doc["icon"] = "mdi:update";
+  JsonObject device4 = doc["device"].to<JsonObject>();
   device4["identifiers"][0] = ha_device_id;
   device4["name"] = ha_device_name;
   device4["manufacturer"] = "Custom";
   device4["model"] = "Heater Controller";
   device4["sw_version"] = FIRMWARE_VERSION;
-  char buf4[640]; serializeJson(doc4, buf4);
-  mqttClient.publish(disc_btn.c_str(), buf4, true);
+  serializeJson(doc, buf);
+  mqttClient.publish(disc_btn.c_str(), buf, true);
+  yield();
 }
 
 // Web server handler for settings portal trigger
@@ -791,6 +857,17 @@ void loop() {
     mqttReconnect();
   }
   mqttClient.loop();
+
+  if (ota_update_pending) {
+    String pendingUrl = ota_update_url;
+    ota_update_pending = false;
+    ota_update_url = "";
+    if (mqttClient.connected()) {
+      mqttClient.disconnect();
+      delay(50);
+    }
+    performSelfUpdate(pendingUrl);
+  }
 
   // handle precondition sequence state machine
   if (seq_step == 1 && millis() >= seq_step_until) {
