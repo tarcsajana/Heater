@@ -204,7 +204,10 @@ String resolveGitHubLatestAssetUrl(const String& inputUrl) {
 
 // HTTP firmware update from URL
 void performSelfUpdate(String url) {
+  String originalUrl = url;
   url = resolveGitHubLatestAssetUrl(url);
+  Serial.printf("[OTA DEBUG] Original URL: %s\n", originalUrl.c_str());
+  Serial.printf("[OTA DEBUG] Resolved URL: %s\n", url.c_str());
   Serial.printf("Starting firmware update from: %s\n", url.c_str());
 
   ESPhttpUpdate.rebootOnUpdate(false);
@@ -229,6 +232,7 @@ void performSelfUpdate(String url) {
   });
 
   Serial.printf("[OTA DEBUG] Free heap before update: %u\n", ESP.getFreeHeap());
+  Serial.printf("[OTA DEBUG] Update attempt for: %s\n", url.c_str());
   yield();
 
   t_httpUpdate_return ret;
@@ -243,6 +247,8 @@ void performSelfUpdate(String url) {
     ret = ESPhttpUpdate.update(plainClient, url);
   }
 
+  Serial.printf("[OTA DEBUG] Update result code: %d\n", ret);
+  
   if (ret == HTTP_UPDATE_OK) {
     Serial.println("Self-update OK - rebooting");
     delay(1000);
@@ -255,9 +261,12 @@ void performSelfUpdate(String url) {
     return;
   }
 
-  Serial.printf("Update failed: (%d) %s\n",
+  // HTTP_UPDATE_FAILED or other error
+  Serial.printf("[OTA DEBUG] HTTP error code: %d\n", ESPhttpUpdate.getLastHTTPCode());
+  Serial.printf("[OTA DEBUG] Last error: %d (%s)\n",
                 ESPhttpUpdate.getLastError(),
                 ESPhttpUpdate.getLastErrorString().c_str());
+  Serial.printf("[OTA DEBUG] Error details available at update end\n");
 }
 
 // Check if sun is down (before sunrise or after sunset)
