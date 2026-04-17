@@ -1,17 +1,18 @@
-Heater (Wemos D1 mini) MQTT firmware
+Heater ESP32-C3 MQTT firmware
 
 Summary
-- ESP8266 (Wemos D1 mini) sketch using PlatformIO
-- WiFi configuration portal (WiFiManager) with custom fields for MQTT and calibration
-- MQTT via `PubSubClient` and Home Assistant MQTT Discovery
-- Inverted relay outputs on specified D pins, and analog battery reading
+- ESP32-C3 sketch using PlatformIO
+- WiFi configuration portal (WiFiManager) for WiFi plus battery calibration values
+- MQTT via `PubSubClient`, Home Assistant MQTT Discovery, and FirmwareOTA integration
+- Inverted relay outputs on GPIO pins, and analog battery reading
 
 Pinout
-- `D8` -> Relay1 -> LIGHT (inverted)
-- `D5` -> Relay4 -> ACC (inverted)
-- `D7` -> Relay2 -> READY (inverted)
-- `D6` -> Relay3 -> HORN (inverted)
-- `A0` -> battery ADC (use `voltage multiplier` to calibrate)
+- `GPIO3` -> Relay1 -> LIGHT (inverted)
+- `GPIO4` -> Relay4 -> ACC (inverted)
+- `GPIO5` -> Relay2 -> READY (inverted)
+- `GPIO6` -> Relay3 -> ILLUMINATION (inverted)
+- `GPIO0` -> battery ADC (use `voltage multiplier` to calibrate)
+- Adjust the GPIO constants in `src/main.cpp` if your ESP32-C3 board is wired differently.
 
 MQTT Topics (default base topic `heater`)
 - `<base>/<mac>/relay1/set` (command)
@@ -25,13 +26,17 @@ MQTT Topics (default base topic `heater`)
 - `<base>/<mac>/precondition/set` (precondition on/off)
 - `<base>/<mac>/precondition/state`
 - `<base>/<mac>/battery` (battery voltage, V)
+- `<base>/<mac>/command` (FirmwareOTA command topic, payload `self_update`)
+- `<base>/<mac>/firmware` (firmware metadata topic)
+- `<base>/<mac>/status` (availability topic)
 
 Home Assistant
 - The firmware publishes MQTT discovery messages under `homeassistant/...` so entities should appear automatically.
+- OTA now follows the same command/firmware/status topic pattern used by CanBridge.
 - Relay mapping per your request:
   - `relay4` -> ACC
   - `relay2` -> READY
-  - `relay3` -> HORN
+  - `relay3` -> ILLUMINATION
   - `relay1` -> LIGHT
   - `precondition` -> PRECONDITION switch
 
@@ -44,9 +49,10 @@ Precondition behavior
 - If battery voltage falls below the configured `Low Voltage Threshold` (default `10.5V`), PRECONDITION will be enabled automatically for 20 minutes.
 
 Setup
-1. Build and upload with PlatformIO (`env:wemos8266`).
+1. Build and upload with PlatformIO (`env:esp32c3`).
 2. On first boot, the device will start an AP `Heater-Setup-AP`. Connect and configure WiFi and MQTT server credentials and calibration values.
 3. After connecting to WiFi, the device will connect to MQTT and publish Home Assistant discovery config.
+4. OTA updates can be triggered over MQTT by publishing `self_update` to `<base>/<mac>/command`, matching the CanBridge OTA command flow.
 
 Calibration
 - The field `Voltage Multiplier` in the portal multiplies the measured ADC voltage to the real battery voltage. Default is `12.00` which is a reasonable starting point for 12V batteries; calibrate with a multimeter.
@@ -54,6 +60,7 @@ Calibration
 Notes
 - The sketch stores configuration in EEPROM.
 - Adjust `voltage_divider` if readings are incorrect.
+- ESP32-C3 ADC scaling differs from ESP8266, so expect to recalibrate the battery reading after moving the hardware.
 
 If you'd like, I can:
 - add OTA updates

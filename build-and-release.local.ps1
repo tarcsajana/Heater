@@ -1,6 +1,6 @@
 # Heater - Build and upload to latest GitHub release (portable/local machine variant)
 param(
-    [string]$Environment = "wemos8266",
+    [string]$Environment = "esp32c3",
     [string]$Repo = "tarcsajana/Heater"
 )
 
