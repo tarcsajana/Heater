@@ -8,7 +8,7 @@
 #include <FirmwareOTA.h>
 #include <time.h>
 
-const char* FIRMWARE_VERSION = "1.2";
+const char* FIRMWARE_VERSION = "2.0";
 const char* FIRMWARE_BUILD_TIME = __DATE__ " " __TIME__;
 const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/latest/download/firmware.bin";
 
@@ -30,8 +30,8 @@ const uint16_t MQTT_PORT = 1883;
 const char* MQTT_USER = "lpomtbnx:lpomtbnx";
 const char* MQTT_PASS = "9htYKaGbPej2YOYyHYGZEbkWdpDdT0Mv";
 const char* DEFAULT_BASE_TOPIC = "heater";
-const char* DEFAULT_WIFI_SSID = "HuNor";
-const char* DEFAULT_WIFI_PASS = "1234554321";
+const char* DEFAULT_WIFI_SSID = "HunorCar";
+const char* DEFAULT_WIFI_PASS = "Jucymucy8581";
 const char* DEVICE_ID = "heater_esp32c3";
 const char* DEVICE_NAME = "Heater Controller";
 const char* LEGACY_FIRMWARE_CMD = "heater/firmware/set";
