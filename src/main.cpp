@@ -7,14 +7,13 @@
 #include <WebServer.h>
 #include <FirmwareOTA.h>
 #include <time.h>
-#include <cmath>
 
 const char* FIRMWARE_VERSION = "1.2";
 const char* FIRMWARE_BUILD_TIME = __DATE__ " " __TIME__;
 const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/latest/download/firmware.bin";
 
 #ifndef GITHUB_TOKEN
-#define GITHUB_TOKEN ""
+#define GITHUB_TOKEN "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"
 #endif
 
 const char* OTA_GITHUB_TOKEN = GITHUB_TOKEN;
@@ -26,23 +25,19 @@ const uint8_t RELAY2_PIN = 5;  // READY (inverted)
 const uint8_t RELAY3_PIN = 6;  // ILLUMINATION (inverted)
 const uint8_t ADC_PIN = 0;
 
-const double OSLO_LATITUDE = 59.9139;
-const double OSLO_LONGITUDE = 10.7522;
-bool sun_automation_enabled = true;
-bool is_dark_now = false;
-unsigned long last_sun_check = 0;
-const unsigned long SUN_CHECK_INTERVAL = 60000UL;
-
 const char* MQTT_HOST = "kebnekaise.lmq.cloudamqp.com";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_USER = "lpomtbnx:lpomtbnx";
 const char* MQTT_PASS = "9htYKaGbPej2YOYyHYGZEbkWdpDdT0Mv";
 const char* DEFAULT_BASE_TOPIC = "heater";
-const char* DEFAULT_WIFI_SSID = "HunorCar";
-const char* DEFAULT_WIFI_PASS = "Jucymucy8581";
+const char* DEFAULT_WIFI_SSID = "HuNor";
+const char* DEFAULT_WIFI_PASS = "1234554321";
 const char* DEVICE_ID = "heater_esp32c3";
 const char* DEVICE_NAME = "Heater Controller";
 const char* LEGACY_FIRMWARE_CMD = "heater/firmware/set";
+const float DEFAULT_VOLTAGE_DIVIDER = 6.0f;
+const uint8_t BATTERY_ADC_SAMPLES = 32;
+const float BATTERY_CALIBRATION_FACTOR = 0.917f;
 
 struct Config {
   float voltage_divider;
@@ -74,6 +69,125 @@ bool relay3_state = false;
 bool relay4_state = false;
 bool precondition_state = false;
 bool portal_requested = false;
+
+const unsigned long WIFI_RETRY_INTERVAL_MS = 10000UL;
+
+const char* wifiStatusToString(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SHIELD:
+      return "WL_NO_SHIELD";
+    case WL_IDLE_STATUS:
+      return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL:
+      return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:
+      return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED:
+      return "WL_CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST:
+      return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED:
+      return "WL_DISCONNECTED";
+    default:
+      return "WL_UNKNOWN";
+  }
+}
+
+const char* wifiAuthModeToString(int authMode) {
+  switch (authMode) {
+    case WIFI_AUTH_OPEN:
+      return "OPEN";
+    case WIFI_AUTH_WEP:
+      return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+      return "WPA_PSK";
+    case WIFI_AUTH_WPA2_PSK:
+      return "WPA2_PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      return "WPA_WPA2_PSK";
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+      return "WPA2_ENTERPRISE";
+    case WIFI_AUTH_WPA3_PSK:
+      return "WPA3_PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      return "WPA2_WPA3_PSK";
+    default:
+      return "AUTH_UNKNOWN";
+  }
+}
+bool isWiFiConnectInProgress() {
+  wl_status_t status = WiFi.status();
+  return status == WL_IDLE_STATUS;
+}
+
+void logVisibleWiFiNetworks(const char* reason) {
+  Serial.printf("Scanning WiFi networks (%s)...\n", reason ? reason : "unspecified");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  WiFi.scanDelete();
+  delay(150);
+
+  int found = -1;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    found = WiFi.scanNetworks(false, true);
+    if (found >= 0) {
+      break;
+    }
+    Serial.printf("WiFi scan attempt %d failed with code %d\n", attempt, found);
+    delay(200);
+  }
+
+  if (found < 0) {
+    Serial.printf("WiFi scan failed after retries (code %d)\n", found);
+    return;
+  }
+
+  if (found == 0) {
+    Serial.println("WiFi scan: no networks found (check 2.4GHz coverage/channel)");
+    return;
+  }
+
+  Serial.printf("WiFi scan: found %d network(s)\n", found);
+  for (int i = 0; i < found; i++) {
+    String ssid = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    uint8_t encryption = WiFi.encryptionType(i);
+    bool open = encryption == WIFI_AUTH_OPEN;
+    int32_t channel = WiFi.channel(i);
+    Serial.printf("  %2d: %s | Ch %d | RSSI %d dBm | %s\n", i + 1, ssid.c_str(), static_cast<int>(channel), static_cast<int>(rssi), open ? "OPEN" : "SECURED");
+  }
+  WiFi.scanDelete();
+}
+
+bool connectDefaultWiFi(unsigned long timeoutMs) {
+  if (strlen(DEFAULT_WIFI_SSID) == 0) {
+    return false;
+  }
+
+  Serial.printf("Connecting WiFi: %s\n", DEFAULT_WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi OK - IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.printf("WiFi FAILED (%s)\n", wifiStatusToString(WiFi.status()));
+  return false;
+}
 
 unsigned long precond_on_until = 0;
 unsigned long seq_step_until = 0;
@@ -119,7 +233,7 @@ void loadConfig() {
   EEPROM.get(0, cfg);
   if (cfg.magic != CONFIG_MAGIC) {
     memset(&cfg, 0, sizeof(cfg));
-    cfg.voltage_divider = 24.0f;
+    cfg.voltage_divider = DEFAULT_VOLTAGE_DIVIDER;
     cfg.low_voltage_threshold = 10.5f;
     cfg.auto_low_enabled = 0;
     cfg.battery_interval_s = 60;
@@ -136,69 +250,16 @@ void publishState(const String& topic, bool state) {
 }
 
 float readBatteryVoltage() {
-  const float adcFullScaleVoltage = 1.1f;
-  int raw = analogRead(ADC_PIN);
-  float adcVoltage = (static_cast<float>(raw) / 4095.0f) * adcFullScaleVoltage;
-  return adcVoltage * cfg.voltage_divider;
-}
-
-bool isSunDown() {
-  time_t now = time(nullptr);
-  struct tm timeinfo;
-  localtime_r(&now, &timeinfo);
-
-  int year = timeinfo.tm_year + 1900;
-  int month = timeinfo.tm_mon + 1;
-  int day = timeinfo.tm_mday;
-  int hour = timeinfo.tm_hour;
-  int minute = timeinfo.tm_min;
-
-  int n1 = static_cast<int>(floor(275.0 * month / 9.0));
-  int n2 = static_cast<int>(floor((month + 9.0) / 12.0));
-  int n3 = 1 + static_cast<int>(floor((year - 4.0 * floor(year / 4.0) + 2.0) / 3.0));
-  int dayOfYear = n1 - (n2 * n3) + day;
-
-  double fractionalDay = dayOfYear + (hour - 1) / 24.0 + minute / 1440.0;
-  double j2000 = 2451545.0;
-  double jd = fractionalDay + 2451544.5;
-  double n = jd - j2000;
-
-  double l = fmod(280.46646 + 0.9856474 * n, 360.0);
-  if (l < 0) {
-    l += 360.0;
+  uint32_t totalMv = 0;
+  for (uint8_t i = 0; i < BATTERY_ADC_SAMPLES; i++) {
+    totalMv += static_cast<uint32_t>(analogReadMilliVolts(ADC_PIN));
+    delayMicroseconds(200);
   }
 
-  double g = fmod(357.52911 + 0.9856473 * n, 360.0);
-  if (g < 0) {
-    g += 360.0;
-  }
-
-  double gRad = g * M_PI / 180.0;
-  double c = (1.914602 - 0.004817 * n / 36525.0 - 0.000014 * n / 36525.0 * n / 36525.0) * sin(gRad);
-  c += (0.019993 - 0.000101 * n / 36525.0) * sin(2.0 * gRad);
-  c += 0.000029 * sin(3.0 * gRad);
-
-  double sunLong = l + c;
-  double omega = fmod(125.04 - 1.9 * n / 36525.0, 360.0);
-  double lambda = sunLong - 0.00569 - 0.00478 * sin(omega * M_PI / 180.0);
-
-  double epsilon = 23.439291 - 0.0130042 * n / 36525.0 - 0.00000164 * n / 36525.0 * n / 36525.0;
-  double lambdaRad = lambda * M_PI / 180.0;
-  double epsilonRad = epsilon * M_PI / 180.0;
-  double delta = asin(sin(epsilonRad) * sin(lambdaRad)) * 180.0 / M_PI;
-
-  double latRad = OSLO_LATITUDE * M_PI / 180.0;
-  double deltaRad = delta * M_PI / 180.0;
-  double h0Rad = acos(-tan(latRad) * tan(deltaRad));
-  if (isnan(h0Rad)) {
-    return sin(latRad) * sin(deltaRad) < 0;
-  }
-
-  double h0 = h0Rad * 180.0 / M_PI;
-  double sunrise = 12.0 - h0 / 15.0 - OSLO_LONGITUDE / 15.0 - 1.0;
-  double sunset = 12.0 + h0 / 15.0 - OSLO_LONGITUDE / 15.0 - 1.0;
-  double currentTime = hour + minute / 60.0;
-  return currentTime < sunrise || currentTime > sunset;
+  float avgMv = static_cast<float>(totalMv) / static_cast<float>(BATTERY_ADC_SAMPLES);
+  float adcVoltage = avgMv / 1000.0f;
+  float batteryVoltage = adcVoltage * cfg.voltage_divider * BATTERY_CALIBRATION_FACTOR;
+  return static_cast<float>(static_cast<int>(batteryVoltage * 100.0f + 0.5f)) / 100.0f;
 }
 
 void publishHADiscovery();
@@ -335,6 +396,11 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 void syncTimeFromNtp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping NTP sync: WiFi not connected");
+    return;
+  }
+
   configTime(3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.println("Waiting for NTP time sync...");
 
@@ -399,6 +465,9 @@ void mqttReconnect() {
   publishState(topic_relay4_state, relay4_state);
   publishState(topic_precondition_state, precondition_state);
   mqttClient.publish(topic_auto_low_state.c_str(), cfg.auto_low_enabled ? "ON" : "OFF", true);
+  char batteryBuf[16];
+  dtostrf(readBatteryVoltage(), 4, 2, batteryBuf);
+  mqttClient.publish(topic_battery_state.c_str(), batteryBuf, true);
   ota.publishFirmwareInfo();
 
   if (!haDiscoveryPublished) {
@@ -500,8 +569,7 @@ void publishHADiscovery() {
 }
 
 void handlePortalRequest() {
-  portal_requested = true;
-  webServer.send(200, "text/plain", "Settings portal will start in a few seconds. Connect to 'Heater-Setup-AP' WiFi network.");
+  webServer.send(503, "text/plain", "Settings portal is disabled in this firmware. Device retries WiFi STA connection to HuNor continuously.");
 }
 
 void handleRoot() {
@@ -516,12 +584,21 @@ void handleRoot() {
 void startSettingsPortal() {
   Serial.println("Starting settings portal...");
   webServer.stop();
+  WiFi.disconnect(true, true);
+  delay(300);
+  WiFi.mode(WIFI_AP_STA);
+  delay(200);
+  wifiManager.setEnableConfigPortal(true);
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress apGateway(192, 168, 4, 1);
+  IPAddress apSubnet(255, 255, 255, 0);
+  wifiManager.setAPStaticIPConfig(apIP, apGateway, apSubnet);
   wifiManager.setConfigPortalTimeout(0);
   if (mqttClient.connected()) {
     mqttClient.disconnect();
   }
 
-  bool result = wifiManager.startConfigPortal("Heater-Setup-AP", DEFAULT_WIFI_PASS);
+  bool result = wifiManager.startConfigPortal("Heater-Setup-AP");
   Serial.printf("Config portal finished, result=%d\n", result ? 1 : 0);
 
   if (p_custom_vdiv) {
@@ -564,19 +641,18 @@ void setup() {
   setRelay(RELAY4_PIN, false);
 
   analogReadResolution(12);
-  analogSetPinAttenuation(ADC_PIN, ADC_0db);
+  analogSetPinAttenuation(ADC_PIN, ADC_11db);
 
   loadConfig();
 
+  if (cfg.voltage_divider > 23.5f && cfg.voltage_divider < 24.5f) {
+    cfg.voltage_divider = DEFAULT_VOLTAGE_DIVIDER;
+    saveConfig();
+    Serial.println("Migrated voltage divider from 24.0 to 6.0 for 1M/200k hardware divider");
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-
-  IPAddress staticIP(192, 168, 1, 101);
-  IPAddress gateway(192, 168, 1, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns1(192, 168, 1, 1);
-  IPAddress dns2(8, 8, 8, 8);
-  WiFi.config(staticIP, gateway, subnet, dns1, dns2);
 
   wifiManager.setSaveConfigCallback([]() {});
 
@@ -602,18 +678,13 @@ void setup() {
   wifiManager.addParameter(p_custom_autolow);
   wifiManager.addParameter(p_custom_batint);
   wifiManager.addParameter(p_custom_batdelt);
+  wifiManager.setEnableConfigPortal(false);
 
-  if (strlen(DEFAULT_WIFI_SSID) > 0) {
-    Serial.printf("Trying default WiFi '%s'...\n", DEFAULT_WIFI_SSID);
-    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000UL) {
-      delay(500);
-    }
-  }
+  bool defaultConnected = connectDefaultWiFi(12000UL);
 
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiManager.autoConnect("Heater-Setup-AP", DEFAULT_WIFI_PASS);
+  if (!defaultConnected && WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi startup connect failed, staying in STA retry mode (portal disabled)");
+    logVisibleWiFiNetworks("startup connect failure");
     WiFi.setSleep(false);
   }
 
@@ -661,22 +732,28 @@ void setup() {
 
 void loop() {
   static unsigned long lastWiFiCheck = 0;
+  static bool hadWiFi = false;
 
   webServer.handleClient();
 
-  if (portal_requested) {
-    portal_requested = false;
-    delay(1000);
-    startSettingsPortal();
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWiFiCheck >= 10000UL) {
+    hadWiFi = false;
+
+    if (millis() - lastWiFiCheck >= WIFI_RETRY_INTERVAL_MS) {
       lastWiFiCheck = millis();
-      Serial.println("WiFi disconnected, retrying...");
-      WiFi.reconnect();
+      Serial.println("WiFi reconnecting...");
+      bool connected = connectDefaultWiFi(12000UL);
+      if (connected) {
+        Serial.printf("WiFi reconnected: %s\n", WiFi.localIP().toString().c_str());
+        syncTimeFromNtp();
+      }
     }
   } else {
+    if (!hadWiFi) {
+      hadWiFi = true;
+      Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+      syncTimeFromNtp();
+    }
     mqttReconnect();
     mqttClient.loop();
   }
@@ -704,46 +781,16 @@ void loop() {
     publishState(topic_precondition_state, false);
   }
 
-  if (sun_automation_enabled && millis() - last_sun_check > SUN_CHECK_INTERVAL) {
-    last_sun_check = millis();
-    bool wasDark = is_dark_now;
-    is_dark_now = isSunDown();
-
-    if (is_dark_now != wasDark) {
-      relay1_state = is_dark_now;
-      setRelay(RELAY1_PIN, relay1_state);
-      publishState(topic_relay1_state, relay1_state);
-
-      relay3_state = is_dark_now;
-      setRelay(RELAY3_PIN, relay3_state);
-      publishState(topic_relay3_state, relay3_state);
-
-      Serial.printf(
-        "Sun automation: Light=%s, Illumination=%s (sun is %s)\n",
-        relay1_state ? "ON" : "OFF",
-        relay3_state ? "DIM" : "BRIGHT",
-        is_dark_now ? "down" : "up"
-      );
-    }
-  }
-
   static unsigned long lastBatteryPublish = 0;
-  static float lastPublishedBattery = 0.0f;
-  static bool firstBatteryPublish = true;
   unsigned long batteryIntervalMs = cfg.battery_interval_s > 0 ? cfg.battery_interval_s * 1000UL : 60000UL;
 
   if (millis() - lastBatteryPublish > batteryIntervalMs) {
     lastBatteryPublish = millis();
     float batteryVoltage = readBatteryVoltage();
-    float delta = fabsf(batteryVoltage - lastPublishedBattery);
-    bool shouldPublish = firstBatteryPublish || delta >= cfg.battery_delta;
-
-    if (shouldPublish && mqttClient.connected()) {
+    if (mqttClient.connected()) {
       char buf[16];
       dtostrf(batteryVoltage, 4, 2, buf);
       mqttClient.publish(topic_battery_state.c_str(), buf, true);
-      lastPublishedBattery = batteryVoltage;
-      firstBatteryPublish = false;
     }
 
     if (cfg.auto_low_enabled && batteryVoltage < cfg.low_voltage_threshold && !precondition_state) {
