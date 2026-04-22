@@ -13,7 +13,7 @@ const char* FIRMWARE_BUILD_TIME = __DATE__ " " __TIME__;
 const char* FIRMWARE_URL = "https://github.com/tarcsajana/Heater/releases/latest/download/firmware.bin";
 
 #ifndef GITHUB_TOKEN
-#define GITHUB_TOKEN "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"
+#define GITHUB_TOKEN ""
 #endif
 
 const char* OTA_GITHUB_TOKEN = GITHUB_TOKEN;
