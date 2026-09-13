@@ -36,6 +36,7 @@ const char* DEVICE_ID = "heater_esp32c3";
 const char* DEVICE_NAME = "Heater Controller";
 const char* LEGACY_FIRMWARE_CMD = "heater/firmware/set";
 const float DEFAULT_VOLTAGE_DIVIDER = 6.0f;
+const float DEFAULT_LOW_VOLTAGE_THRESHOLD = 11.7f;
 const uint8_t BATTERY_ADC_SAMPLES = 32;
 const float BATTERY_CALIBRATION_FACTOR = 0.917f;
 
@@ -234,7 +235,7 @@ void loadConfig() {
   if (cfg.magic != CONFIG_MAGIC) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.voltage_divider = DEFAULT_VOLTAGE_DIVIDER;
-    cfg.low_voltage_threshold = 10.5f;
+    cfg.low_voltage_threshold = DEFAULT_LOW_VOLTAGE_THRESHOLD;
     cfg.auto_low_enabled = 0;
     cfg.battery_interval_s = 60;
     cfg.battery_delta = 0.10f;
@@ -551,6 +552,25 @@ void publishHADiscovery() {
   mqttClient.publish(firmwareDiscoveryTopic.c_str(), buf, true);
   yield();
 
+  String onlineDiscoveryTopic = String("homeassistant/binary_sensor/") + node + "/online/config";
+  doc.clear();
+  doc["name"] = "Heater Online";
+  doc["uniq_id"] = node + String("_online");
+  doc["stat_t"] = topic_status;
+  doc["pl_on"] = "online";
+  doc["pl_off"] = "offline";
+  doc["dev_cla"] = "connectivity";
+  doc["entity_category"] = "diagnostic";
+  JsonObject onlineDevice = doc["device"].to<JsonObject>();
+  onlineDevice["identifiers"][0] = haDeviceId;
+  onlineDevice["name"] = haDeviceName;
+  onlineDevice["manufacturer"] = "Custom";
+  onlineDevice["model"] = "Heater Controller ESP32-C3";
+  onlineDevice["sw_version"] = FIRMWARE_VERSION;
+  serializeJson(doc, buf);
+  mqttClient.publish(onlineDiscoveryTopic.c_str(), buf, true);
+  yield();
+
   String updateDiscoveryTopic = String("homeassistant/button/") + node + "/self_update/config";
   doc.clear();
   doc["name"] = "Heater Self Update";
@@ -649,6 +669,12 @@ void setup() {
     cfg.voltage_divider = DEFAULT_VOLTAGE_DIVIDER;
     saveConfig();
     Serial.println("Migrated voltage divider from 24.0 to 6.0 for 1M/200k hardware divider");
+  }
+
+  if (cfg.low_voltage_threshold > 10.4f && cfg.low_voltage_threshold < 10.6f) {
+    cfg.low_voltage_threshold = DEFAULT_LOW_VOLTAGE_THRESHOLD;
+    saveConfig();
+    Serial.println("Migrated low voltage threshold from 10.5V to 11.7V default");
   }
 
   WiFi.mode(WIFI_STA);
